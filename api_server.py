@@ -453,6 +453,11 @@ def parse_args():
         help="Model path or HuggingFace Hub ID",
     )
     parser.add_argument("--device", default="cuda:0", help="CUDA device")
+    # 必须使用 bfloat16。float16 动态范围小（max ~65504），talker logits 容易溢出为
+    # inf/nan，导致采样时 CUDA device-side assert（"probability tensor contains
+    # either inf, nan or element < 0"）或 EOS 永远采不到而生成超长无意义音频。
+    # 在 Jetson Thor 上已确认 float16 必现此问题，bfloat16 正常。
+    parser.add_argument("--dtype", default="bfloat16", help="Model dtype (bfloat16 recommended, float16 causes sampling errors)")
     parser.add_argument("--host", default="0.0.0.0", help="Listen host")
     parser.add_argument("--port", type=int, default=8000, help="Listen port")
     parser.add_argument(
@@ -488,6 +493,7 @@ def main():
     _model = FasterQwen3TTS.from_pretrained(
         args.model_path,
         device=args.device,
+        dtype=args.dtype,
     )
     logger.info("Model loaded")
 
