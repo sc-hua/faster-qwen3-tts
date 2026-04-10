@@ -172,6 +172,15 @@ class FasterQwen3TTS:
         logger.info("Warming up CUDA graphs...")
         self.predictor_graph.capture(num_warmup=3)
         self.talker_graph.capture(prefill_len=prefill_len, num_warmup=3)
+
+        # Capture codec decoder CUDA graphs
+        from .codec_graph import CodecGraphDecoder
+        decoder = self.model.model.speech_tokenizer.model.decoder
+        self._codec_graph = CodecGraphDecoder(decoder)
+        self._codec_graph.capture(device=torch.device(self.device))
+        # Monkey-patch so speech_tokenizer.decode() uses CUDA-graphed decoder
+        decoder.chunked_decode = self._codec_graph.chunked_decode
+
         self._warmed_up = True
         logger.info("CUDA graphs captured and ready")
     
