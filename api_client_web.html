@@ -1,0 +1,488 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Streaming TTS Player</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #1a1a2e; color: #e0e0e0; min-height: 100vh; display: flex; justify-content: center; padding: 20px; }
+.container { max-width: 720px; width: 100%; }
+h1 { text-align: center; margin: 20px 0 30px; color: #a0c4ff; font-size: 1.5rem; }
+.field { margin-bottom: 14px; }
+.field label { display: block; font-size: 0.85rem; color: #8899aa; margin-bottom: 4px; }
+.field input, .field textarea { width: 100%; padding: 10px 12px; background: #16213e; border: 1px solid #334; border-radius: 6px; color: #e0e0e0; font-size: 0.95rem; outline: none; transition: border-color 0.2s; }
+.field input:focus, .field textarea:focus { border-color: #a0c4ff; }
+.field textarea { resize: vertical; min-height: 80px; font-family: inherit; }
+.field-row { display: flex; gap: 12px; }
+.field-row .field { flex: 1; }
+.buttons { display: flex; gap: 12px; margin: 20px 0; }
+.buttons button { flex: 1; padding: 12px; border: none; border-radius: 6px; font-size: 1rem; font-weight: 600; cursor: pointer; transition: background 0.2s, opacity 0.2s; }
+#btnGenerate { background: #4cc9f0; color: #1a1a2e; }
+#btnGenerate:hover { background: #72d6f5; }
+#btnGenerate:disabled { opacity: 0.4; cursor: not-allowed; }
+#btnNonStream { background: rgb(201, 157, 251); color: #fff; }
+#btnNonStream:hover { background: #9588f0; }
+#btnNonStream:disabled { opacity: 0.4; cursor: not-allowed; }
+#btnStop { background: #f07167; color: #fff; }
+#btnStop:hover { background: #f4918a; }
+#btnStop:disabled { opacity: 0.4; cursor: not-allowed; }
+.stats { background: #16213e; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+.stats-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px 20px; }
+.stat-item { display: flex; justify-content: space-between; font-size: 0.9rem; }
+.stat-label { color: #8899aa; }
+.stat-value { color: #a0c4ff; font-family: 'SF Mono', 'Fira Code', monospace; }
+#status { text-align: center; margin-bottom: 10px; font-size: 0.85rem; color: #8899aa; min-height: 1.2em; }
+canvas { width: 100%; height: 80px; background: #16213e; border-radius: 8px; display: block; }
+</style>
+</head>
+<body>
+<div class="container">
+<h1>Streaming TTS Player</h1>
+
+<div class="field">
+  <label>Text</label>
+  <textarea id="inputText" placeholder="Enter text to synthesize...">Today is a beautiful day. The sun is shining and birds are singing.</textarea>
+</div>
+
+<div class="field-row">
+  <div class="field">
+    <label>Server</label>
+    <input id="inputServer" value="http://localhost:8000">
+  </div>
+  <div class="field">
+    <label>Voice (optional)</label>
+    <div style="display:flex;gap:8px">
+      <input id="inputVoice" placeholder="Speaker name" style="flex:1">
+      <button id="btnListSpeakers" style="white-space:nowrap;padding:0 14px;background:#6c757d;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:0.85rem">List</button>
+    </div>
+  </div>
+</div>
+
+<div class="field-row">
+  <div class="field">
+    <label>Ref Audio (optional)</label>
+    <div style="display:flex;gap:8px;align-items:center">
+      <input id="inputRefAudio" placeholder="/path/to/ref.wav or URL" style="flex:1">
+      <button type="button" id="btnUploadRef" onclick="document.getElementById('fileRefAudio').click()" style="white-space:nowrap;padding:8px 16px;background:#3a86a0;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:0.85rem">Upload</button>
+      <input type="file" id="fileRefAudio" accept="audio/*,.pt" style="display:none">
+      <button id="btnAddSpeaker" style="white-space:nowrap;padding:8px 16px;background:#6c757d;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:0.85rem">Add Speaker</button>
+    </div>
+  </div>
+  <div class="field">
+    <label>Ref Text (optional)</label>
+    <input id="inputRefText" placeholder="Transcript of ref audio">
+  </div>
+</div>
+
+<div class="field-row">
+  <div class="field">
+    <label>Chunk Size (codec steps, 12 ≈ 1s)</label>
+    <input id="inputChunkSize" type="number" value="4" min="1" max="128">
+  </div>
+  <div class="field"></div>
+</div>
+
+<div class="buttons">
+  <button id="btnGenerate">Stream</button>
+  <button id="btnNonStream">Non-Stream</button>
+  <button id="btnStop" disabled>Stop</button>
+</div>
+
+<div id="status"></div>
+
+<div class="stats">
+  <div class="stats-grid">
+    <div class="stat-item"><span class="stat-label">TTFA</span><span class="stat-value" id="statTTFA">—</span></div>
+    <div class="stat-item"><span class="stat-label">Received</span><span class="stat-value" id="statBytes">0 B</span></div>
+    <div class="stat-item"><span class="stat-label">Audio Duration</span><span class="stat-value" id="statDuration">0.00s</span></div>
+    <div class="stat-item"><span class="stat-label">Elapsed</span><span class="stat-value" id="statElapsed">0.00s</span></div>
+    <div class="stat-item"><span class="stat-label">RTF</span><span class="stat-value" id="statRTF">—</span></div>
+    <div class="stat-item"><span class="stat-label">Sample Rate</span><span class="stat-value" id="statSR">—</span></div>
+  </div>
+</div>
+
+<canvas id="waveform"></canvas>
+</div>
+
+<script>
+// --- State ---
+let audioCtx = null;
+let reader = null;
+let aborted = false;
+let nextStartTime = 0;
+let sourceNodes = [];
+let analyser = null;
+let animFrameId = null;
+let startTime = 0;
+let totalBytes = 0;
+let sampleRate = 24000;
+let ttfa = null;
+let elapsedTimer = null;
+
+// --- DOM refs ---
+const btnGen = document.getElementById('btnGenerate');
+const btnNonStream = document.getElementById('btnNonStream');
+const btnStop = document.getElementById('btnStop');
+const statusEl = document.getElementById('status');
+const canvas = document.getElementById('waveform');
+const ctx = canvas.getContext('2d');
+
+// --- Helpers ---
+function setStatus(msg) { statusEl.textContent = msg; }
+
+function fmtBytes(n) {
+  if (n < 1024) return n + ' B';
+  if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
+  return (n / 1048576).toFixed(2) + ' MB';
+}
+
+function resetStats() {
+  totalBytes = 0; ttfa = null;
+  document.getElementById('statTTFA').textContent = '—';
+  document.getElementById('statBytes').textContent = '0 B';
+  document.getElementById('statDuration').textContent = '0.00s';
+  document.getElementById('statElapsed').textContent = '0.00s';
+  document.getElementById('statRTF').textContent = '—';
+  document.getElementById('statSR').textContent = '—';
+}
+
+function updateStats() {
+  const elapsed = (performance.now() - startTime) / 1000;
+  const nSamples = totalBytes / 2;
+  const duration = nSamples / sampleRate;
+  document.getElementById('statBytes').textContent = fmtBytes(totalBytes);
+  document.getElementById('statDuration').textContent = duration.toFixed(2) + 's';
+  document.getElementById('statElapsed').textContent = elapsed.toFixed(2) + 's';
+  if (elapsed > 0 && duration > 0) {
+    document.getElementById('statRTF').textContent = (elapsed / duration).toFixed(3);
+  }
+}
+
+// --- Waveform visualization ---
+function initCanvas() {
+  canvas.width = canvas.clientWidth * devicePixelRatio;
+  canvas.height = canvas.clientHeight * devicePixelRatio;
+  ctx.scale(devicePixelRatio, devicePixelRatio);
+}
+
+function drawWaveform() {
+  if (!analyser) return;
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  const bufLen = analyser.frequencyBinCount;
+  const data = new Uint8Array(bufLen);
+  analyser.getByteTimeDomainData(data);
+
+  ctx.fillStyle = '#16213e';
+  ctx.fillRect(0, 0, w, h);
+  ctx.lineWidth = 1.5;
+  ctx.strokeStyle = '#4cc9f0';
+  ctx.beginPath();
+
+  const sliceW = w / bufLen;
+  let x = 0;
+  for (let i = 0; i < bufLen; i++) {
+    const y = (data[i] / 255) * h;
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    x += sliceW;
+  }
+  ctx.lineTo(w, h / 2);
+  ctx.stroke();
+  animFrameId = requestAnimationFrame(drawWaveform);
+}
+
+// --- PCM int16 → float32 AudioBuffer ---
+function pcmToAudioBuffer(int16Array) {
+  const numSamples = int16Array.length;
+  const buffer = audioCtx.createBuffer(1, numSamples, sampleRate);
+  const channel = buffer.getChannelData(0);
+  for (let i = 0; i < numSamples; i++) {
+    channel[i] = int16Array[i] / 32768.0;
+  }
+  return buffer;
+}
+
+// --- Schedule a chunk for gapless playback ---
+function scheduleChunk(audioBuffer) {
+  const source = audioCtx.createBufferSource();
+  source.buffer = audioBuffer;
+  source.connect(analyser);
+  analyser.connect(audioCtx.destination);
+
+  // Ensure we never schedule in the past
+  nextStartTime = Math.max(nextStartTime, audioCtx.currentTime + 0.01);
+  source.start(nextStartTime);
+  nextStartTime += audioBuffer.duration;
+
+  sourceNodes.push(source);
+  source.onended = () => {
+    const idx = sourceNodes.indexOf(source);
+    if (idx !== -1) sourceNodes.splice(idx, 1);
+  };
+}
+
+// --- Stop playback and streaming ---
+function stopAll() {
+  aborted = true;
+  if (reader) { reader.cancel().catch(() => {}); reader = null; }
+  sourceNodes.forEach(s => { try { s.stop(); s.disconnect(); } catch(e) {} });
+  sourceNodes = [];
+  if (animFrameId) { cancelAnimationFrame(animFrameId); animFrameId = null; }
+  if (elapsedTimer) { clearInterval(elapsedTimer); elapsedTimer = null; }
+  btnGen.disabled = false;
+  btnNonStream.disabled = false;
+  btnStop.disabled = true;
+  setStatus('Stopped');
+}
+
+// --- Helper: read common inputs ---
+function getInputs() {
+  const text = document.getElementById('inputText').value.trim();
+  const server = document.getElementById('inputServer').value.trim();
+  const voice = document.getElementById('inputVoice').value.trim();
+  const refAudio = document.getElementById('inputRefAudio').value.trim();
+  const refText = document.getElementById('inputRefText').value.trim();
+  const chunkSize = parseInt(document.getElementById('inputChunkSize').value) || 12;
+  return { text, server, voice, refAudio, refText, chunkSize };
+}
+
+function buildPayload(inputs, stream) {
+  const p = { input: inputs.text, stream, response_format: 'pcm', chunk_size: inputs.chunkSize };
+  if (inputs.voice) p.voice = inputs.voice;
+  if (inputs.refAudio) p.ref_audio = inputs.refAudio;
+  if (inputs.refText) p.ref_text = inputs.refText;
+  return p;
+}
+
+// --- Main generate function ---
+async function generate() {
+  const inputs = getInputs();
+  if (!inputs.text) { setStatus('Please enter some text'); return; }
+  const payload = buildPayload(inputs, true);
+
+  // Reset state
+  stopAll();
+  aborted = false;
+  resetStats();
+  btnGen.disabled = true;
+  btnNonStream.disabled = true;
+  btnStop.disabled = false;
+  setStatus('Connecting...');
+
+  // Init AudioContext
+  if (!audioCtx || audioCtx.state === 'closed') {
+    audioCtx = new AudioContext();
+  }
+  if (audioCtx.state === 'suspended') {
+    await audioCtx.resume();
+  }
+  analyser = audioCtx.createAnalyser();
+  analyser.fftSize = 2048;
+  nextStartTime = 0;
+
+  initCanvas();
+  drawWaveform();
+
+  startTime = performance.now();
+  elapsedTimer = setInterval(updateStats, 200);
+
+  let leftover = new Uint8Array(0);
+
+  try {
+    const resp = await fetch(`${inputs.server}/v1/audio/speech`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error(`HTTP ${resp.status}: ${errText}`);
+    }
+
+    sampleRate = parseInt(resp.headers.get('X-Sample-Rate') || '24000', 10);
+    document.getElementById('statSR').textContent = sampleRate + ' Hz';
+    setStatus('Streaming...');
+
+    reader = resp.body.getReader();
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done || aborted) break;
+
+      // Record TTFA on first chunk
+      if (ttfa === null) {
+        ttfa = (performance.now() - startTime) / 1000;
+        document.getElementById('statTTFA').textContent = ttfa.toFixed(3) + 's';
+      }
+
+      totalBytes += value.byteLength;
+
+      // Merge leftover + new data, ensure int16 alignment
+      const merged = new Uint8Array(leftover.length + value.byteLength);
+      merged.set(leftover);
+      merged.set(value, leftover.length);
+
+      const alignedLen = merged.length - (merged.length % 2);
+      leftover = merged.slice(alignedLen);
+
+      if (alignedLen > 0) {
+        const int16 = new Int16Array(merged.buffer, merged.byteOffset, alignedLen / 2);
+        const audioBuffer = pcmToAudioBuffer(int16);
+        scheduleChunk(audioBuffer);
+      }
+    }
+
+    if (!aborted) {
+      updateStats();
+      setStatus('Done — audio playing');
+      btnGen.disabled = false;
+      btnNonStream.disabled = false;
+      btnStop.disabled = false;
+    }
+  } catch (err) {
+    if (!aborted) {
+      setStatus('Error: ' + err.message);
+      btnGen.disabled = false;
+      btnNonStream.disabled = false;
+      btnStop.disabled = true;
+    }
+  } finally {
+    reader = null;
+    if (elapsedTimer) { clearInterval(elapsedTimer); elapsedTimer = null; }
+  }
+}
+
+// --- Non-streaming generate ---
+async function generateNonStream() {
+  const inputs = getInputs();
+  if (!inputs.text) { setStatus('Please enter some text'); return; }
+  const payload = buildPayload(inputs, false);
+
+  stopAll();
+  aborted = false;
+  resetStats();
+  btnGen.disabled = true;
+  btnNonStream.disabled = true;
+  setStatus('Generating (non-stream)...');
+
+  if (!audioCtx || audioCtx.state === 'closed') audioCtx = new AudioContext();
+  if (audioCtx.state === 'suspended') await audioCtx.resume();
+  analyser = audioCtx.createAnalyser();
+  analyser.fftSize = 2048;
+  nextStartTime = 0;
+  initCanvas();
+  drawWaveform();
+
+  startTime = performance.now();
+
+  try {
+    const resp = await fetch(`${inputs.server}/v1/audio/speech`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${await resp.text()}`);
+
+    sampleRate = parseInt(resp.headers.get('X-Sample-Rate') || '24000', 10);
+    document.getElementById('statSR').textContent = sampleRate + ' Hz';
+
+    const buf = await resp.arrayBuffer();
+    totalBytes = buf.byteLength;
+    ttfa = (performance.now() - startTime) / 1000;
+    document.getElementById('statTTFA').textContent = ttfa.toFixed(3) + 's';
+
+    const int16 = new Int16Array(buf);
+    const audioBuffer = pcmToAudioBuffer(int16);
+    scheduleChunk(audioBuffer);
+
+    updateStats();
+    setStatus('Done — audio playing');
+  } catch (err) {
+    setStatus('Error: ' + err.message);
+  } finally {
+    btnGen.disabled = false;
+    btnNonStream.disabled = false;
+  }
+}
+
+// --- Add speaker ---
+async function addSpeaker() {
+  const name = document.getElementById('inputVoice').value.trim();
+  if (!name) { setStatus('Please enter a speaker name in Voice field'); return; }
+  const server = document.getElementById('inputServer').value.trim();
+  const refText = document.getElementById('inputRefText').value.trim();
+  const fileInput = document.getElementById('fileRefAudio');
+  const refAudioStr = document.getElementById('inputRefAudio').value.trim();
+
+  // Build multipart form
+  const form = new FormData();
+  form.append('name', name);
+  form.append('ref_text', refText);
+  form.append('mode', 'xvec');
+
+  if (fileInput.files.length > 0) {
+    form.append('audio_sample', fileInput.files[0]);
+  } else if (refAudioStr.startsWith('data:')) {
+    const resp = await fetch(refAudioStr);
+    const blob = await resp.blob();
+    form.append('audio_sample', blob, 'ref_audio.wav');
+  } else {
+    setStatus('Please upload a ref audio file first'); return;
+  }
+
+  setStatus('Adding speaker...');
+  try {
+    const resp = await fetch(`${server}/v1/audio/voices`, {
+      method: 'POST',
+      body: form,
+    });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${await resp.text()}`);
+    const data = await resp.json();
+    setStatus(`Speaker "${data.name}" added`);
+    document.getElementById('inputRefAudio').value = '';
+    document.getElementById('inputRefText').value = '';
+    fileInput.value = '';
+  } catch (err) {
+    setStatus('Add speaker error: ' + err.message);
+  }
+}
+
+// --- List speakers ---
+async function listSpeakers() {
+  const server = document.getElementById('inputServer').value.trim();
+  try {
+    const resp = await fetch(`${server}/v1/audio/voices`);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${await resp.text()}`);
+    const data = await resp.json();
+    const names = data.voices.map(v => v.name);
+    setStatus(names.length ? 'Speakers: ' + names.join(', ') : 'No speakers registered');
+  } catch (err) {
+    setStatus('List error: ' + err.message);
+  }
+}
+
+// --- Upload ref audio as base64 data URI ---
+document.getElementById('fileRefAudio').addEventListener('change', function(e) {
+  const file = e.target.files[0];
+  if (!file) return;
+  setStatus(`Reading "${file.name}"...`);
+  const reader = new FileReader();
+  reader.onload = function() {
+    document.getElementById('inputRefAudio').value = reader.result;
+    setStatus(`Loaded "${file.name}" (${fmtBytes(file.size)})`);
+  };
+  reader.onerror = function() { setStatus('Failed to read file'); };
+  reader.readAsDataURL(file);
+});
+
+// --- Event listeners ---
+btnGen.addEventListener('click', generate);
+btnNonStream.addEventListener('click', generateNonStream);
+document.getElementById('btnAddSpeaker').addEventListener('click', addSpeaker);
+document.getElementById('btnListSpeakers').addEventListener('click', listSpeakers);
+btnStop.addEventListener('click', stopAll);
+window.addEventListener('resize', () => { if (animFrameId) initCanvas(); });
+</script>
+</body>
+</html>
