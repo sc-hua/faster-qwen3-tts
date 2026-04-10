@@ -41,7 +41,6 @@ import json
 import logging
 import os
 import queue
-import struct
 import sys
 import threading
 from typing import AsyncGenerator, Optional
@@ -54,6 +53,12 @@ from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from faster_qwen3_tts.audio_utils import (  # noqa: E402
+    audio_to_pcm16_bytes,
+    create_wav_header,
+    media_type,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -88,35 +93,6 @@ class SpeechRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-def _to_pcm16(pcm: np.ndarray) -> bytes:
-    """Convert float32 numpy array to raw 16-bit little-endian PCM bytes."""
-    return np.clip(pcm * 32768, -32768, 32767).astype(np.int16).tobytes()
-
-
-def _wav_header(sample_rate: int, data_len: int = 0xFFFFFFFF) -> bytes:
-    """Build a WAV header.  Use data_len=0xFFFFFFFF for streaming (unknown size)."""
-    n_channels = 1
-    bits = 16
-    byte_rate = sample_rate * n_channels * bits // 8
-    block_align = n_channels * bits // 8
-    riff_size = 0xFFFFFFFF if data_len == 0xFFFFFFFF else 36 + data_len
-    buf = io.BytesIO()
-    buf.write(b"RIFF")
-    buf.write(struct.pack("<I", riff_size))
-    buf.write(b"WAVE")
-    buf.write(b"fmt ")
-    buf.write(struct.pack("<IHHIIHH", 16, 1, n_channels, sample_rate,
-                          byte_rate, block_align, bits))
-    buf.write(b"data")
-    buf.write(struct.pack("<I", data_len))
-    return buf.getvalue()
-
-
-def _to_wav_bytes(pcm: np.ndarray, sample_rate: int) -> bytes:
-    """Convert float32 numpy array to a complete WAV file in memory."""
-    raw = _to_pcm16(pcm)
-    return _wav_header(sample_rate, len(raw)) + raw
-
 
 def _to_mp3_bytes(pcm: np.ndarray, sample_rate: int) -> bytes:
     """Convert float32 numpy array to MP3 bytes (requires pydub + ffmpeg)."""
@@ -128,7 +104,7 @@ def _to_mp3_bytes(pcm: np.ndarray, sample_rate: int) -> bytes:
             detail="response_format='mp3' requires pydub: pip install pydub",
         )
     segment = AudioSegment(
-        _to_pcm16(pcm),
+        audio_to_pcm16_bytes(pcm),
         frame_rate=sample_rate,
         sample_width=2,
         channels=1,
@@ -203,7 +179,7 @@ async def _stream_chunks(voice_cfg: dict, text: str) -> AsyncGenerator[bytes, No
             break
         if isinstance(item, Exception):
             raise item
-        yield _to_pcm16(item)
+        yield audio_to_pcm16_bytes(item)
 
 
 # ---------------------------------------------------------------------------
@@ -226,17 +202,13 @@ async def create_speech(req: SpeechRequest):
     voice_cfg = resolve_voice(req.voice)
     fmt = req.response_format.lower()
 
-    _CONTENT_TYPES = {
-        "wav": "audio/wav",
-        "pcm": "audio/pcm",
-        "mp3": "audio/mpeg",
-    }
-    if fmt not in _CONTENT_TYPES:
+    _ALLOWED_FORMATS = {"wav", "pcm", "mp3"}
+    if fmt not in _ALLOWED_FORMATS:
         raise HTTPException(
             status_code=400,
             detail=f"response_format {fmt!r} not supported. Use: wav, pcm, mp3",
         )
-    content_type = _CONTENT_TYPES[fmt]
+    content_type = media_type(fmt)
 
     # --- MP3: generate all audio, then encode (non-streaming) ---
     if fmt == "mp3":
@@ -258,7 +230,7 @@ async def create_speech(req: SpeechRequest):
     # --- WAV / PCM: stream chunks as they are generated ---
     async def audio_stream():
         if fmt == "wav":
-            yield _wav_header(SAMPLE_RATE)  # stream with unknown data length
+            yield create_wav_header(SAMPLE_RATE)  # stream with unknown data length
         async for raw_chunk in _stream_chunks(voice_cfg, req.input):
             yield raw_chunk
 

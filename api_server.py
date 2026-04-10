@@ -11,10 +11,8 @@ Usage:
 import argparse
 import asyncio
 import base64
-import io
 import logging
 import re
-import struct
 import tempfile
 
 import urllib.request
@@ -23,12 +21,18 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncGenerator, Optional
 
-import numpy as np
 import soundfile as sf
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
+
+from faster_qwen3_tts.audio_utils import (
+    audio_to_pcm16_bytes,
+    create_wav_header,
+    encode_audio,
+    media_type,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -92,13 +96,6 @@ class ErrorResponse(BaseModel):
 
 # ── Audio helpers ────────────────────────────────────────────────
 
-_SUPPORTED_FORMATS = {
-    "wav": ("WAV", "audio/wav", {}),
-    "pcm": ("RAW", "audio/pcm", {"subtype": "PCM_16"}),
-    "flac": ("FLAC", "audio/flac", {}),
-    "mp3": ("MP3", "audio/mpeg", {}),
-}
-
 _REF_AUDIO_MIN_DURATION = 1.0  # seconds
 _REF_AUDIO_MAX_DURATION = 30.0  # seconds
 
@@ -124,51 +121,6 @@ def _write_temp_file(data: bytes, ext: str) -> str:
     tmp.close()
     return tmp.name
 
-
-def _encode_audio(audio: np.ndarray, sample_rate: int, fmt: str) -> bytes:
-    """Encode numpy audio array to bytes in the specified format."""
-    if fmt not in _SUPPORTED_FORMATS:
-        fmt = "wav"
-    sf_format, _, kwargs = _SUPPORTED_FORMATS[fmt]
-    buf = io.BytesIO()
-    sf.write(buf, audio, sample_rate, format=sf_format, **kwargs)
-    return buf.getvalue()
-
-
-def _media_type(fmt: str) -> str:
-    return _SUPPORTED_FORMATS.get(fmt, _SUPPORTED_FORMATS["wav"])[1]
-
-
-def _create_wav_header(
-    sample_rate: int, num_channels: int = 1, bits_per_sample: int = 16
-) -> bytes:
-    """Create a WAV header with placeholder size for streaming."""
-    byte_rate = sample_rate * num_channels * bits_per_sample // 8
-    block_align = num_channels * bits_per_sample // 8
-    placeholder = 0xFFFFFFFF
-    return struct.pack(
-        "<4sI4s4sIHHIIHH4sI",
-        b"RIFF",
-        placeholder,
-        b"WAVE",
-        b"fmt ",
-        16,
-        1,  # PCM
-        num_channels,
-        sample_rate,
-        byte_rate,
-        block_align,
-        bits_per_sample,
-        b"data",
-        placeholder,
-    )
-
-
-def _audio_to_pcm16_bytes(audio: np.ndarray) -> bytes:
-    """Convert float32 audio to PCM16 bytes."""
-    pcm = np.clip(audio, -1.0, 1.0)
-    pcm = (pcm * 32767).astype(np.int16)
-    return pcm.tobytes()
 
 
 # ── ref_audio resolution ────────────────────────────────────────
@@ -272,10 +224,10 @@ async def _stream_tts(
                 continue
 
             if first_chunk and fmt == "wav":
-                yield _create_wav_header(sr)
+                yield create_wav_header(sr)
                 first_chunk = False
 
-            yield _audio_to_pcm16_bytes(audio_chunk)
+            yield audio_to_pcm16_bytes(audio_chunk)
 
 
 # ── App lifecycle ────────────────────────────────────────────────
@@ -346,7 +298,7 @@ async def create_speech(request: SpeechRequest):
                 fmt = "pcm"
             return StreamingResponse(
                 _stream_tts(request, ref_audio_path),
-                media_type=_media_type(fmt),
+                media_type=media_type(fmt),
                 headers={
                     "X-Sample-Rate": str(_model.sample_rate),
                     "X-Request-Id": str(uuid.uuid4()),
@@ -370,11 +322,11 @@ async def create_speech(request: SpeechRequest):
             )
 
         audio = audio_list[0]
-        audio_bytes = _encode_audio(audio, sr, request.response_format)
+        audio_bytes = encode_audio(audio, sr, request.response_format)
 
         return Response(
             content=audio_bytes,
-            media_type=_media_type(request.response_format),
+            media_type=media_type(request.response_format),
             headers={
                 "X-Sample-Rate": str(sr),
                 "X-Request-Id": str(uuid.uuid4()),

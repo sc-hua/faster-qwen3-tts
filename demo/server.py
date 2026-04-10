@@ -41,6 +41,8 @@ except ImportError:
     print("Install with:  pip install -e .  (from the repo root)")
     sys.exit(1)
 
+from faster_qwen3_tts.audio_utils import encode_audio_base64
+
 from nano_parakeet import from_pretrained as _parakeet_from_pretrained
 
 
@@ -180,16 +182,6 @@ _AUDIO_TOO_LARGE_MSG = (
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
-
-def _to_wav_b64(audio: np.ndarray, sr: int) -> str:
-    if audio.dtype != np.float32:
-        audio = audio.astype(np.float32)
-    if audio.ndim > 1:
-        audio = audio.squeeze()
-    buf = io.BytesIO()
-    sf.write(buf, audio, sr, format="WAV", subtype="PCM_16")
-    b64 = base64.b64encode(buf.getvalue()).decode()
-    return b64
 
 
 def _concat_audio(audio_list) -> np.ndarray:
@@ -459,7 +451,7 @@ async def generate_stream(
                 total_audio_s += dur
                 rtf = total_audio_s / (total_gen_ms / 1000) if total_gen_ms > 0 else 0.0
 
-                audio_b64 = _to_wav_b64(audio_chunk, sr)
+                audio_b64 = encode_audio_base64(audio_chunk, sr)
                 payload = {
                     "type": "chunk",
                     "audio_b64": audio_b64,
@@ -483,7 +475,7 @@ async def generate_stream(
                 total_audio_s += dur
                 rtf = total_audio_s / (total_gen_ms / 1000) if total_gen_ms > 0 else 0.0
 
-                audio_b64 = _to_wav_b64(audio_chunk, sr)
+                audio_b64 = encode_audio_base64(audio_chunk, sr)
                 payload = {
                     "type": "chunk",
                     "audio_b64": audio_b64,
@@ -659,7 +651,7 @@ async def generate_non_streaming(
         audio, sr, elapsed, dur = await asyncio.to_thread(run)
         rtf = dur / elapsed if elapsed > 0 else 0.0
         return JSONResponse({
-            "audio_b64": _to_wav_b64(audio, sr),
+            "audio_b64": encode_audio_base64(audio, sr),
             "sample_rate": sr,
             "metrics": {
                 "total_ms": round(elapsed * 1000),
