@@ -4,6 +4,7 @@ FasterQwen3TTS: Real-time TTS using CUDA graph capture.
 Wrapper class that provides a Qwen3-TTS API while using
 CUDA graphs for 6-10x speedup.
 """
+import collections
 import logging
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional, Tuple, Union
@@ -13,8 +14,21 @@ import soundfile as sf
 import torch
 
 from .utils import suppress_flash_attn_warning
+from .voice_manager import MODE_ICL, MODE_XVEC
 
 logger = logging.getLogger(__name__)
+
+
+def _audio_to_numpy(audio) -> np.ndarray:
+    """Convert codec decoder output to a flat numpy array.
+
+    The speech tokenizer may return either a torch Tensor or a numpy array
+    depending on the backend.  This helper normalises both to a flat 1-D
+    numpy array so callers don't need a per-element type check.
+    """
+    if hasattr(audio, "cpu"):
+        return audio.flatten().cpu().numpy()
+    return np.asarray(audio).flatten()
 
 
 
@@ -44,7 +58,196 @@ class FasterQwen3TTS:
         self.max_seq_len = max_seq_len
         self.sample_rate = self._infer_sample_rate(base_model)
         self._warmed_up = False
-        self._voice_prompt_cache = {}  # Cache (ref_audio, ref_text) -> (vcp, ref_ids)
+        # LRU cache for extracted voice prompts (GPU tensors).
+        # Avoids re-extracting the same reference audio on repeated calls.
+        self._voice_prompt_cache = collections.OrderedDict()
+        # 64 entries ≈ a few MB of GPU memory; keeps the common "handful of
+        # voices in rotation" use case entirely cache-hot.
+        self._voice_prompt_cache_max = 64
+
+    def _cache_voice_prompt(self, key, value):
+        """Insert into LRU cache, evicting oldest entry if over limit."""
+        self._voice_prompt_cache[key] = value
+        while len(self._voice_prompt_cache) > self._voice_prompt_cache_max:
+            self._voice_prompt_cache.popitem(last=False)
+
+    def _prompt_dict_to_vcp(
+        self,
+        prompt_dict: dict,
+        input_ids,
+        ref_text: str = "",
+    ) -> Tuple[Dict[str, Any], list, bool]:
+        """Convert an ``extract_voice_prompt`` dict into runtime VCP format.
+
+        This is the single conversion point used by both ``_load_voice_prompt_pt``
+        and ``_resolve_voice_clone_prompt_from_reference`` so the two paths cannot
+        diverge silently.
+
+        Returns ``(vcp, ref_ids, using_icl_mode)``.
+        """
+        mode = prompt_dict.get("mode", MODE_XVEC)
+        spk_emb = prompt_dict["ref_spk_embedding"]
+        if spk_emb.device != torch.device(self.device) or spk_emb.dtype != self.dtype:
+            spk_emb = spk_emb.to(device=self.device, dtype=self.dtype)
+
+        if mode == MODE_XVEC:
+            vcp = dict(
+                ref_code=[None],
+                ref_spk_embedding=[spk_emb],
+                x_vector_only_mode=[True],
+                icl_mode=[False],
+            )
+            return vcp, [None] * len(input_ids), False
+
+        # ICL mode
+        ref_code = prompt_dict.get("ref_code")
+        if ref_code is None:
+            raise ValueError("ICL-mode prompt dict has no ref_code")
+        ref_code = ref_code.to(device=self.device)
+
+        effective_ref_text = ref_text or prompt_dict.get("ref_text", "")
+        if not effective_ref_text:
+            raise ValueError(
+                "ref_text is required for ICL mode but neither the prompt dict "
+                "nor the call-site provided one."
+            )
+
+        vcp = dict(
+            ref_code=[ref_code],
+            ref_spk_embedding=[spk_emb],
+            x_vector_only_mode=[False],
+            icl_mode=[True],
+        )
+        ref_id = self.model._tokenize_texts(
+            [self.model._build_ref_text(effective_ref_text)]
+        )[0]
+        return vcp, [ref_id], True
+
+    def _decode_and_log(
+        self,
+        codec_ids,
+        speech_tokenizer,
+        timing: dict,
+        ref_codes=None,
+    ) -> Tuple[list, int]:
+        """Decode codec tokens to audio waveform and log timing stats.
+
+        Shared by the three non-streaming generate methods to avoid
+        duplicating the decode → numpy → trim → log boilerplate.
+        """
+        if codec_ids is None:
+            logger.warning("Generation returned no tokens")
+            return [np.zeros(1, dtype=np.float32)], self.sample_rate
+
+        if ref_codes is not None:
+            codes_for_decode = torch.cat(
+                [ref_codes.to(codec_ids.device), codec_ids], dim=0
+            )
+        else:
+            codes_for_decode = codec_ids
+
+        audio_list, sr = speech_tokenizer.decode(
+            {"audio_codes": codes_for_decode.unsqueeze(0)}
+        )
+
+        ref_len = ref_codes.shape[0] if ref_codes is not None else 0
+        total_len = codes_for_decode.shape[0]
+        audio_arrays = []
+        for a in audio_list:
+            a = _audio_to_numpy(a)
+            if ref_len > 0:
+                cut = int(ref_len / max(total_len, 1) * len(a))
+                a = a[cut:]
+            audio_arrays.append(a)
+
+        n_steps = timing["steps"]
+        audio_duration = n_steps / 12.0  # 12 Hz codec
+        total_time = timing["prefill_ms"] / 1000 + timing["decode_s"]
+        rtf = audio_duration / total_time if total_time > 0 else 0
+        logger.info(
+            f"Generated {audio_duration:.2f}s audio in {total_time:.2f}s "
+            f"({timing['ms_per_step']:.1f}ms/step, RTF: {rtf:.2f})"
+        )
+
+        return audio_arrays, sr
+
+    @staticmethod
+    def _streaming_decode_chunks(
+        speech_tokenizer,
+        codec_stream,
+        chunk_size: int,
+        ref_codes=None,
+    ) -> "Generator[Tuple[np.ndarray, int, dict], None, None]":
+        """Shared streaming decode loop for all three streaming generate methods.
+
+        Two-phase hybrid strategy:
+          Phase 1 (accumulated): decode all codes so far to get exact audio, while
+          calibrating the samples-per-frame ratio.
+          Phase 2 (sliding window): decode only the new chunk plus a fixed left
+          context, using the calibrated ratio to trim context audio — keeps decode
+          cost bounded regardless of total length.
+
+        When *ref_codes* is provided (ICL voice-clone mode), reference codes are
+        prepended during Phase 1 so the codec decoder has proper acoustic context,
+        then the reference audio portion is trimmed from the output.
+        """
+        context_frames = 25
+        min_calibration_frames = max(context_frames, chunk_size)
+        all_codes = []
+        prev_gen_audio_len = 0
+        samples_per_frame = None
+
+        for codec_chunk, timing in codec_stream:
+            all_codes.append(codec_chunk)
+            n_new = codec_chunk.shape[0]
+            all_flat = torch.cat(all_codes, dim=0)
+            n_total = all_flat.shape[0]
+
+            if samples_per_frame is None:
+                # Phase 1: accumulated decode until we can calibrate.
+                if ref_codes is not None:
+                    codes_input = torch.cat(
+                        [ref_codes.to(all_flat.device), all_flat], dim=0
+                    )
+                else:
+                    codes_input = all_flat
+                audio_list, sr = speech_tokenizer.decode(
+                    {"audio_codes": codes_input.unsqueeze(0)}
+                )
+                audio = _audio_to_numpy(audio_list[0])
+
+                # Trim reference audio portion if present
+                if ref_codes is not None:
+                    ref_len = ref_codes.shape[0]
+                    total_len = codes_input.shape[0]
+                    ref_audio_cut = int(ref_len / max(total_len, 1) * len(audio))
+                    gen_audio = audio[ref_audio_cut:]
+                else:
+                    gen_audio = audio
+
+                new_audio = gen_audio[prev_gen_audio_len:]
+                prev_gen_audio_len = len(gen_audio)
+
+                if n_total >= min_calibration_frames:
+                    samples_per_frame = len(gen_audio) / n_total
+            else:
+                # Phase 2: sliding window with bounded context
+                ctx_start = max(0, n_total - n_new - context_frames)
+                window = all_flat[ctx_start:]
+                n_ctx = window.shape[0] - n_new
+
+                audio_list, sr = speech_tokenizer.decode(
+                    {"audio_codes": window.unsqueeze(0)}
+                )
+                audio = _audio_to_numpy(audio_list[0])
+
+                if n_ctx > 0:
+                    ctx_samples = int(round(n_ctx * samples_per_frame))
+                    new_audio = audio[ctx_samples:]
+                else:
+                    new_audio = audio
+
+            yield new_audio, sr, timing
 
     @staticmethod
     def _get_speech_tokenizer(base_model):
@@ -221,6 +424,65 @@ class FasterQwen3TTS:
             audio = np.concatenate([audio, silence])
         return audio, sr
 
+    def extract_voice_prompt(
+        self,
+        ref_audio: Union[str, Path],
+        ref_text: str = "",
+        xvec_only: bool = True,
+        append_silence: bool = True,
+    ) -> dict:
+        """Extract a reusable voice prompt dict from reference audio.
+
+        The returned dict can be saved with ``torch.save()`` and later loaded
+        to skip the speaker encoder / audio tokenizer at inference time.
+
+        Args:
+            ref_audio: Path to reference audio file.
+            ref_text: Transcription of the reference audio.  Required when
+                ``xvec_only=False`` (ICL mode).
+            xvec_only: When *True* extract only the speaker embedding
+                (x-vector).  When *False* also extract codec tokens
+                (``ref_code``) for full ICL voice cloning.
+            append_silence: Append trailing silence before encoding
+                (ICL only, prevents phoneme bleed-through).
+
+        Returns:
+            A dict ready for ``torch.save``:
+
+            * xvec mode:  ``{version, mode, ref_spk_embedding}``
+            * ICL mode:   ``{version, mode, ref_spk_embedding, ref_code, ref_text}``
+        """
+        if not xvec_only and not ref_text:
+            raise ValueError("ref_text is required for ICL mode (xvec_only=False)")
+
+        if xvec_only:
+            prompt_items = self.model.create_voice_clone_prompt(
+                ref_audio=str(ref_audio),
+                ref_text="",
+                x_vector_only_mode=True,
+            )
+            return {
+                "version": 1,
+                "mode": MODE_XVEC,
+                "ref_spk_embedding": prompt_items[0].ref_spk_embedding.cpu(),
+            }
+
+        # ICL mode
+        silence_secs = 0.5 if append_silence else 0.0
+        ref_audio_input = self._load_ref_audio_with_silence(ref_audio, silence_secs=silence_secs)
+        prompt_items = self.model.create_voice_clone_prompt(
+            ref_audio=ref_audio_input,
+            ref_text=ref_text,
+        )
+        item = prompt_items[0]
+        return {
+            "version": 1,
+            "mode": MODE_ICL,
+            "ref_spk_embedding": item.ref_spk_embedding.cpu(),
+            "ref_code": item.ref_code.cpu(),
+            "ref_text": item.ref_text or ref_text,
+        }
+
     def _resolve_voice_clone_prompt(
         self,
         input_ids,
@@ -341,6 +603,31 @@ class FasterQwen3TTS:
 
         return vcp, ref_ids, using_icl_mode
 
+    def _load_voice_prompt_pt(
+        self,
+        pt_path: Union[str, Path],
+        input_ids,
+        ref_text: str,
+    ) -> Tuple[Dict[str, Any], list, bool]:
+        """Load a .pt voice prompt file (unified or legacy format).
+
+        Supports:
+        - **Unified dict** (version 1): ``{version, mode, ref_spk_embedding, ...}``
+        - **Legacy tensor**: a bare ``ref_spk_embedding`` tensor (treated as xvec).
+
+        Returns ``(vcp, ref_ids, using_icl_mode)``.
+        """
+        # weights_only=True prevents arbitrary code execution via pickle
+        data = torch.load(str(pt_path), map_location=self.device, weights_only=True)
+
+        # Normalise legacy bare-tensor format into a dict
+        if isinstance(data, torch.Tensor):
+            data = {"mode": MODE_XVEC, "ref_spk_embedding": data}
+        elif not isinstance(data, dict):
+            raise ValueError(f"Unsupported .pt format: expected dict or Tensor, got {type(data).__name__}")
+
+        return self._prompt_dict_to_vcp(data, input_ids, ref_text)
+
     def _resolve_voice_clone_prompt_from_reference(
         self,
         input_ids,
@@ -349,46 +636,34 @@ class FasterQwen3TTS:
         xvec_only: bool,
         append_silence: bool,
     ) -> Tuple[Dict[str, Any], list, bool]:
-        using_icl_mode = not xvec_only
         cache_key = (str(ref_audio), ref_text, xvec_only, append_silence)
         if cache_key in self._voice_prompt_cache:
+            self._voice_prompt_cache.move_to_end(cache_key)
             vcp, ref_ids = self._voice_prompt_cache[cache_key]
+            using_icl_mode = any(vcp.get("icl_mode", [False]))
             return vcp, ref_ids, using_icl_mode
 
-        if xvec_only:
-            prompt_items = self.model.create_voice_clone_prompt(
-                ref_audio=str(ref_audio),
-                ref_text="",
-                x_vector_only_mode=True,
+        # .pt files carry their own mode — ignore xvec_only flag
+        if str(ref_audio).endswith('.pt'):
+            vcp, ref_ids, using_icl_mode = self._load_voice_prompt_pt(
+                pt_path=ref_audio, input_ids=input_ids, ref_text=ref_text,
             )
-            spk_emb = prompt_items[0].ref_spk_embedding
-            vcp = dict(
-                ref_code=[None],
-                ref_spk_embedding=[spk_emb],
-                x_vector_only_mode=[True],
-                icl_mode=[False],
-            )
-            ref_ids = [None] * len(input_ids)
-            self._voice_prompt_cache[cache_key] = (vcp, ref_ids)
+            self._cache_voice_prompt(cache_key, (vcp, ref_ids))
             return vcp, ref_ids, using_icl_mode
 
-        silence_secs = 0.5 if append_silence else 0.0
-        ref_audio_input = self._load_ref_audio_with_silence(ref_audio, silence_secs=silence_secs)
-        prompt_items = self.model.create_voice_clone_prompt(
-            ref_audio=ref_audio_input,
-            ref_text=ref_text
+        # Extract voice prompt then convert to runtime VCP format.
+        # Both steps are routed through single-point helpers so the
+        # extraction logic cannot diverge from extract_voice_prompt().
+        prompt_dict = self.extract_voice_prompt(
+            ref_audio=ref_audio,
+            ref_text=ref_text,
+            xvec_only=xvec_only,
+            append_silence=append_silence,
         )
-        vcp = self.model._prompt_items_to_voice_clone_prompt(prompt_items)
-
-        ref_ids = []
-        rt = prompt_items[0].ref_text
-        if rt:
-            ref_texts = [self.model._build_ref_text(rt)]
-            ref_ids.append(self.model._tokenize_texts(ref_texts)[0])
-        else:
-            ref_ids.append(None)
-
-        self._voice_prompt_cache[cache_key] = (vcp, ref_ids)
+        vcp, ref_ids, using_icl_mode = self._prompt_dict_to_vcp(
+            prompt_dict, input_ids, ref_text,
+        )
+        self._cache_voice_prompt(cache_key, (vcp, ref_ids))
         return vcp, ref_ids, using_icl_mode
 
     def _prepare_generation(
@@ -818,45 +1093,9 @@ class FasterQwen3TTS:
             repetition_penalty=repetition_penalty,
         )
 
-        if codec_ids is None:
-            logger.warning("Generation returned no tokens")
-            return [np.zeros(1, dtype=np.float32)], self.sample_rate
-
-        # In ICL mode: prepend reference codes before decoding so the codec decoder
-        # has acoustic context from the reference audio (matches official implementation).
-        speech_tokenizer = m.speech_tokenizer
-        if ref_codes is not None:
-            ref_codes_dev = ref_codes.to(codec_ids.device)
-            codes_for_decode = torch.cat([ref_codes_dev, codec_ids], dim=0)
-        else:
-            codes_for_decode = codec_ids
-        audio_list, sr = speech_tokenizer.decode({"audio_codes": codes_for_decode.unsqueeze(0)})
-
-        # Convert to numpy and trim off the reference audio portion
-        ref_len = ref_codes.shape[0] if ref_codes is not None else 0
-        total_len = codes_for_decode.shape[0]
-        audio_arrays = []
-        for a in audio_list:
-            if hasattr(a, 'cpu'):  # torch tensor
-                a = a.flatten().cpu().numpy()
-            else:  # already numpy
-                a = a.flatten() if hasattr(a, 'flatten') else a
-            if ref_len > 0:
-                cut = int(ref_len / max(total_len, 1) * len(a))
-                a = a[cut:]
-            audio_arrays.append(a)
-        
-        n_steps = timing['steps']
-        audio_duration = n_steps / 12.0  # 12 Hz codec
-        total_time = timing['prefill_ms']/1000 + timing['decode_s']
-        rtf = audio_duration / total_time if total_time > 0 else 0
-        
-        logger.info(
-            f"Generated {audio_duration:.2f}s audio in {total_time:.2f}s "
-            f"({timing['ms_per_step']:.1f}ms/step, RTF: {rtf:.2f})"
+        return self._decode_and_log(
+            codec_ids, m.speech_tokenizer, timing, ref_codes=ref_codes,
         )
-        
-        return audio_arrays, sr
 
     @torch.inference_mode()
     def generate_voice_clone_streaming(
@@ -934,16 +1173,6 @@ class FasterQwen3TTS:
 
         speech_tokenizer = m.speech_tokenizer
 
-        # Hybrid decode strategy:
-        # 1. Accumulated decode for early chunks (correct, calibrates samples_per_frame)
-        # 2. Sliding window with 25-frame left context once calibrated (constant cost)
-        # This avoids boundary artifacts (pops) while keeping decode cost bounded.
-        context_frames = 25
-        min_calibration_frames = max(context_frames, chunk_size)
-        all_codes = []
-        prev_gen_audio_len = 0  # tracks position within the generated (non-ref) audio
-        samples_per_frame = None
-
         stream_fn = parity_generate_streaming if parity_mode else fast_generate_streaming
         stream_kwargs = dict(
             talker=talker,
@@ -965,65 +1194,12 @@ class FasterQwen3TTS:
             stream_kwargs["predictor_graph"] = self.predictor_graph
             stream_kwargs["talker_graph"] = self.talker_graph
 
-        for codec_chunk, timing in stream_fn(**stream_kwargs):
-            all_codes.append(codec_chunk)
-            n_new = codec_chunk.shape[0]
-            all_flat = torch.cat(all_codes, dim=0)
-            n_total = all_flat.shape[0]
-
-            if samples_per_frame is None:
-                # Phase 1: accumulated decode until we can calibrate.
-                # In ICL mode prepend reference codes so the codec decoder has acoustic
-                # context from the reference audio (matches official implementation).
-                if ref_codes is not None:
-                    codes_input = torch.cat([ref_codes.to(all_flat.device), all_flat], dim=0)
-                else:
-                    codes_input = all_flat
-                audio_list, sr = speech_tokenizer.decode(
-                    {"audio_codes": codes_input.unsqueeze(0)}
-                )
-                audio = audio_list[0]
-                if hasattr(audio, 'cpu'):
-                    audio = audio.flatten().cpu().numpy()
-                else:
-                    audio = audio.flatten() if hasattr(audio, 'flatten') else audio
-
-                # Separate out reference audio portion; track position in generated audio only
-                if ref_codes is not None:
-                    ref_len = ref_codes.shape[0]
-                    total_len = codes_input.shape[0]
-                    ref_audio_cut = int(ref_len / max(total_len, 1) * len(audio))
-                    gen_audio = audio[ref_audio_cut:]
-                else:
-                    gen_audio = audio
-
-                new_audio = gen_audio[prev_gen_audio_len:]
-                prev_gen_audio_len = len(gen_audio)
-
-                if n_total >= min_calibration_frames:
-                    samples_per_frame = len(gen_audio) / n_total
-            else:
-                # Phase 2: sliding window with left context
-                ctx_start = max(0, n_total - n_new - context_frames)
-                window = all_flat[ctx_start:]
-                n_ctx = window.shape[0] - n_new
-
-                audio_list, sr = speech_tokenizer.decode(
-                    {"audio_codes": window.unsqueeze(0)}
-                )
-                audio = audio_list[0]
-                if hasattr(audio, 'cpu'):
-                    audio = audio.flatten().cpu().numpy()
-                else:
-                    audio = audio.flatten() if hasattr(audio, 'flatten') else audio
-
-                if n_ctx > 0:
-                    ctx_samples = int(round(n_ctx * samples_per_frame))
-                    new_audio = audio[ctx_samples:]
-                else:
-                    new_audio = audio
-
-            yield new_audio, sr, timing
+        yield from self._streaming_decode_chunks(
+            speech_tokenizer,
+            stream_fn(**stream_kwargs),
+            chunk_size,
+            ref_codes=ref_codes,
+        )
 
     @torch.inference_mode()
     def generate_custom_voice(
@@ -1078,31 +1254,7 @@ class FasterQwen3TTS:
             repetition_penalty=repetition_penalty,
         )
 
-        if codec_ids is None:
-            logger.warning("Generation returned no tokens")
-            return [np.zeros(1, dtype=np.float32)], self.sample_rate
-
-        speech_tokenizer = m.speech_tokenizer
-        audio_list, sr = speech_tokenizer.decode({"audio_codes": codec_ids.unsqueeze(0)})
-
-        audio_arrays = []
-        for a in audio_list:
-            if hasattr(a, "cpu"):
-                audio_arrays.append(a.flatten().cpu().numpy())
-            else:
-                audio_arrays.append(a.flatten() if hasattr(a, "flatten") else a)
-
-        n_steps = timing["steps"]
-        audio_duration = n_steps / 12.0
-        total_time = timing["prefill_ms"] / 1000 + timing["decode_s"]
-        rtf = audio_duration / total_time if total_time > 0 else 0
-
-        logger.info(
-            f"Generated {audio_duration:.2f}s audio in {total_time:.2f}s "
-            f"({timing['ms_per_step']:.1f}ms/step, RTF: {rtf:.2f})"
-        )
-
-        return audio_arrays, sr
+        return self._decode_and_log(codec_ids, m.speech_tokenizer, timing)
 
     @torch.inference_mode()
     def generate_custom_voice_streaming(
@@ -1142,67 +1294,28 @@ class FasterQwen3TTS:
 
         speech_tokenizer = m.speech_tokenizer
 
-        context_frames = 25
-        min_calibration_frames = max(context_frames, chunk_size)
-        all_codes = []
-        prev_audio_len = 0
-        samples_per_frame = None
-
-        for codec_chunk, timing in fast_generate_streaming(
-            talker=talker,
-            talker_input_embeds=tie,
-            attention_mask=tam,
-            trailing_text_hiddens=tth,
-            tts_pad_embed=tpe,
-            config=config,
-            predictor_graph=self.predictor_graph,
-            talker_graph=self.talker_graph,
-            max_new_tokens=max_new_tokens,
-            min_new_tokens=min_new_tokens,
-            temperature=temperature,
-            top_k=top_k,
-            top_p=top_p,
-            do_sample=do_sample,
-            repetition_penalty=repetition_penalty,
-            chunk_size=chunk_size,
-        ):
-            all_codes.append(codec_chunk)
-            n_new = codec_chunk.shape[0]
-            all_flat = torch.cat(all_codes, dim=0)
-            n_total = all_flat.shape[0]
-
-            if samples_per_frame is None:
-                audio_list, sr = speech_tokenizer.decode({"audio_codes": all_flat.unsqueeze(0)})
-                audio = audio_list[0]
-                if hasattr(audio, "cpu"):
-                    audio = audio.flatten().cpu().numpy()
-                else:
-                    audio = audio.flatten() if hasattr(audio, "flatten") else audio
-
-                new_audio = audio[prev_audio_len:]
-                prev_audio_len = len(audio)
-
-                if n_total >= min_calibration_frames:
-                    samples_per_frame = len(audio) / n_total
-            else:
-                ctx_start = max(0, n_total - n_new - context_frames)
-                window = all_flat[ctx_start:]
-                n_ctx = window.shape[0] - n_new
-
-                audio_list, sr = speech_tokenizer.decode({"audio_codes": window.unsqueeze(0)})
-                audio = audio_list[0]
-                if hasattr(audio, "cpu"):
-                    audio = audio.flatten().cpu().numpy()
-                else:
-                    audio = audio.flatten() if hasattr(audio, "flatten") else audio
-
-                if n_ctx > 0:
-                    ctx_samples = int(round(n_ctx * samples_per_frame))
-                    new_audio = audio[ctx_samples:]
-                else:
-                    new_audio = audio
-
-            yield new_audio, sr, timing
+        yield from self._streaming_decode_chunks(
+            speech_tokenizer,
+            fast_generate_streaming(
+                talker=talker,
+                talker_input_embeds=tie,
+                attention_mask=tam,
+                trailing_text_hiddens=tth,
+                tts_pad_embed=tpe,
+                config=config,
+                predictor_graph=self.predictor_graph,
+                talker_graph=self.talker_graph,
+                max_new_tokens=max_new_tokens,
+                min_new_tokens=min_new_tokens,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                do_sample=do_sample,
+                repetition_penalty=repetition_penalty,
+                chunk_size=chunk_size,
+            ),
+            chunk_size,
+        )
 
     @torch.inference_mode()
     def generate_voice_design(
@@ -1252,31 +1365,7 @@ class FasterQwen3TTS:
             repetition_penalty=repetition_penalty,
         )
 
-        if codec_ids is None:
-            logger.warning("Generation returned no tokens")
-            return [np.zeros(1, dtype=np.float32)], self.sample_rate
-
-        speech_tokenizer = m.speech_tokenizer
-        audio_list, sr = speech_tokenizer.decode({"audio_codes": codec_ids.unsqueeze(0)})
-
-        audio_arrays = []
-        for a in audio_list:
-            if hasattr(a, "cpu"):
-                audio_arrays.append(a.flatten().cpu().numpy())
-            else:
-                audio_arrays.append(a.flatten() if hasattr(a, "flatten") else a)
-
-        n_steps = timing["steps"]
-        audio_duration = n_steps / 12.0
-        total_time = timing["prefill_ms"] / 1000 + timing["decode_s"]
-        rtf = audio_duration / total_time if total_time > 0 else 0
-
-        logger.info(
-            f"Generated {audio_duration:.2f}s audio in {total_time:.2f}s "
-            f"({timing['ms_per_step']:.1f}ms/step, RTF: {rtf:.2f})"
-        )
-
-        return audio_arrays, sr
+        return self._decode_and_log(codec_ids, m.speech_tokenizer, timing)
 
     @torch.inference_mode()
     def generate_voice_design_streaming(
@@ -1311,64 +1400,25 @@ class FasterQwen3TTS:
 
         speech_tokenizer = m.speech_tokenizer
 
-        context_frames = 25
-        min_calibration_frames = max(context_frames, chunk_size)
-        all_codes = []
-        prev_audio_len = 0
-        samples_per_frame = None
-
-        for codec_chunk, timing in fast_generate_streaming(
-            talker=talker,
-            talker_input_embeds=tie,
-            attention_mask=tam,
-            trailing_text_hiddens=tth,
-            tts_pad_embed=tpe,
-            config=config,
-            predictor_graph=self.predictor_graph,
-            talker_graph=self.talker_graph,
-            max_new_tokens=max_new_tokens,
-            min_new_tokens=min_new_tokens,
-            temperature=temperature,
-            top_k=top_k,
-            top_p=top_p,
-            do_sample=do_sample,
-            repetition_penalty=repetition_penalty,
-            chunk_size=chunk_size,
-        ):
-            all_codes.append(codec_chunk)
-            n_new = codec_chunk.shape[0]
-            all_flat = torch.cat(all_codes, dim=0)
-            n_total = all_flat.shape[0]
-
-            if samples_per_frame is None:
-                audio_list, sr = speech_tokenizer.decode({"audio_codes": all_flat.unsqueeze(0)})
-                audio = audio_list[0]
-                if hasattr(audio, "cpu"):
-                    audio = audio.flatten().cpu().numpy()
-                else:
-                    audio = audio.flatten() if hasattr(audio, "flatten") else audio
-
-                new_audio = audio[prev_audio_len:]
-                prev_audio_len = len(audio)
-
-                if n_total >= min_calibration_frames:
-                    samples_per_frame = len(audio) / n_total
-            else:
-                ctx_start = max(0, n_total - n_new - context_frames)
-                window = all_flat[ctx_start:]
-                n_ctx = window.shape[0] - n_new
-
-                audio_list, sr = speech_tokenizer.decode({"audio_codes": window.unsqueeze(0)})
-                audio = audio_list[0]
-                if hasattr(audio, "cpu"):
-                    audio = audio.flatten().cpu().numpy()
-                else:
-                    audio = audio.flatten() if hasattr(audio, "flatten") else audio
-
-                if n_ctx > 0:
-                    ctx_samples = int(round(n_ctx * samples_per_frame))
-                    new_audio = audio[ctx_samples:]
-                else:
-                    new_audio = audio
-
-            yield new_audio, sr, timing
+        yield from self._streaming_decode_chunks(
+            speech_tokenizer,
+            fast_generate_streaming(
+                talker=talker,
+                talker_input_embeds=tie,
+                attention_mask=tam,
+                trailing_text_hiddens=tth,
+                tts_pad_embed=tpe,
+                config=config,
+                predictor_graph=self.predictor_graph,
+                talker_graph=self.talker_graph,
+                max_new_tokens=max_new_tokens,
+                min_new_tokens=min_new_tokens,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                do_sample=do_sample,
+                repetition_penalty=repetition_penalty,
+                chunk_size=chunk_size,
+            ),
+            chunk_size,
+        )

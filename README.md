@@ -420,10 +420,18 @@ CUDA graphs capture the entire decode step and replay it as a single GPU operati
 
 For production use, extract the speaker embedding once and reuse it:
 
-```bash
-# 1. Extract speaker embedding from reference audio (one-time, ~10s)
-python examples/extract_speaker.py --ref_audio voice.wav --output speaker.pt
+```python
+# 1. Extract speaker embedding from reference audio (one-time)
+model = FasterQwen3TTS.from_pretrained("Qwen/Qwen3-TTS-12Hz-1.7B-Base")
+prompt = model.extract_voice_prompt(ref_audio="voice.wav", xvec_only=True)
+torch.save(prompt["ref_spk_embedding"], "speaker.pt")
 
+# Or extract full ICL prompt for highest quality:
+prompt = model.extract_voice_prompt(ref_audio="voice.wav", ref_text="transcript", xvec_only=False)
+torch.save(prompt, "speaker_icl.pt")
+```
+
+```bash
 # 2. Generate speech with CUDA graphs (real-time)
 python examples/generate_with_embedding.py --speaker speaker.pt --text "Hello!" --language English --output en.wav
 python examples/generate_with_embedding.py --speaker speaker.pt --text "Bonjour!" --language French --output fr.wav
