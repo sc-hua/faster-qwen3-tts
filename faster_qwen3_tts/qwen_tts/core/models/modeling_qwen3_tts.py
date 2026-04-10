@@ -1018,7 +1018,9 @@ class Qwen3TTSTalkerCodePredictorModel(Qwen3TTSPreTrainedModel):
 
     def __init__(self, config: Qwen3TTSTalkerCodePredictorConfig, embedding_dim: int):
         super().__init__(config)
-        self.padding_idx = config.pad_token_id
+        # self.padding_idx = config.pad_token_id
+        # transformers>=5.x 不再默认提供 pad_token_id，但这个模型实际上用不到 padding_idx，所以即使没有也不会有问题
+        self.padding_idx = getattr(config, 'pad_token_id', None)
         self.vocab_size = config.vocab_size
         self.layers = nn.ModuleList(
             [Qwen3TTSDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
@@ -1430,7 +1432,9 @@ class Qwen3TTSTalkerModel(Qwen3TTSTalkerTextPreTrainedModel):
 
     def __init__(self, config):
         super().__init__(config)
-        self.padding_idx = config.pad_token_id
+        # self.padding_idx = config.pad_token_id
+        # transformers>=5.x 不再默认提供 pad_token_id，但这个模型实际上用不到 padding_idx，所以即使没有也不会有问题
+        self.padding_idx = getattr(config, 'pad_token_id', None)
         self.vocab_size = config.vocab_size
         self.layers = nn.ModuleList(
             [Qwen3TTSTalkerDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]

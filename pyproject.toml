@@ -27,7 +27,7 @@ classifiers = [
 ]
 requires-python = ">=3.10"
 dependencies = [
-    "transformers>=4.57",
+    "transformers==4.57.3",
     "torch>=2.5.1",
     "numpy",
     "soundfile",
