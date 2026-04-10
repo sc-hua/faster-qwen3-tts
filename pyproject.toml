@@ -27,11 +27,11 @@ classifiers = [
 ]
 requires-python = ">=3.10"
 dependencies = [
-    "qwen-tts>=0.1.1",
     "transformers>=4.57",
     "torch>=2.5.1",
     "numpy",
     "soundfile",
+    "librosa",
     "huggingface-hub",
 ]
 
