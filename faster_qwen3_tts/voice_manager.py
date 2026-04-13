@@ -3,8 +3,6 @@ import atexit
 import hashlib
 import json
 import logging
-import os
-import struct
 import threading
 import time
 from dataclasses import asdict, dataclass, field
@@ -120,6 +118,56 @@ class VoiceManager:
         with self._lock:
             if self._dirty:
                 self._save_registry()
+
+    def startup_cleanup(self, clear_runtime_cache: bool = False) -> Dict[str, int]:
+        """Prune stale cache state left on disk before serving traffic.
+
+        Args:
+            clear_runtime_cache: When ``True``, remove all non-persistent cache
+                entries from previous server runs. Persistent named voices are
+                preserved.
+        """
+        with self._lock:
+            removed_entries = 0
+            removed_files = 0
+            tracked_cache_files = set()
+
+            for name, entry in list(self._registry.items()):
+                pt_path = self.storage_dir / entry.pt_path
+
+                if entry.persistent:
+                    if not pt_path.exists():
+                        logger.warning(
+                            "Dropping registry entry '%s': prompt file missing at %s",
+                            name,
+                            pt_path,
+                        )
+                        self._remove_entry(name)
+                        removed_entries += 1
+                    continue
+
+                if clear_runtime_cache or entry.expired or not pt_path.exists():
+                    self._remove_entry(name)
+                    removed_entries += 1
+                    continue
+
+                tracked_cache_files.add(pt_path.resolve())
+
+            cache_dir = self.storage_dir / "cache"
+            if cache_dir.exists():
+                for pt_path in cache_dir.glob("*.pt"):
+                    resolved = pt_path.resolve()
+                    if clear_runtime_cache or resolved not in tracked_cache_files:
+                        pt_path.unlink(missing_ok=True)
+                        removed_files += 1
+
+            if removed_entries:
+                self._save_registry()
+
+            return {
+                "removed_entries": removed_entries,
+                "removed_files": removed_files,
+            }
 
     # ── CRUD ─────────────────────────────────────────────────────
 
@@ -246,9 +294,9 @@ class VoiceManager:
     ) -> VoiceEntry:
         """Look up or create a cached (non-persistent) voice entry.
 
-        The cache key is derived from the audio file path, size, mtime,
-        ``ref_text``, and mode — so the same file at the same path hits
-        the cache without re-reading the file content.
+        The cache key is derived from the audio content plus the parameters
+        that change prompt extraction, so temp-file paths from separate
+        requests do not create duplicate cache entries.
         """
         if ttl is None:
             ttl = self._default_ttl
@@ -346,20 +394,13 @@ class VoiceManager:
     def _audio_cache_key(
         ref_audio_path: str, ref_text: str, xvec_only: bool, append_silence: bool,
     ) -> str:
-        """Derive a cache key from audio file metadata + parameters.
-
-        Uses path + file size + mtime instead of reading the entire file content,
-        avoiding potentially hundreds of ms of blocking I/O on large audio files
-        in the request hot path.
-        """
+        """Derive a cache key from audio content + prompt-shaping parameters."""
         h = hashlib.sha256()
-        try:
-            st = os.stat(ref_audio_path)
-            h.update(ref_audio_path.encode())
-            h.update(struct.pack("<Qd", st.st_size, st.st_mtime))
-        except OSError:
-            h.update(ref_audio_path.encode())
-        h.update(ref_text.encode())
-        h.update(b"xvec" if xvec_only else b"icl")
-        h.update(b"silence" if append_silence else b"no_silence")
+        with open(ref_audio_path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        h.update(b"\0")
+        h.update(ref_text.encode("utf-8"))
+        h.update(b"\0xvec" if xvec_only else b"\0icl")
+        h.update(b"\0silence" if append_silence else b"\0no_silence")
         return h.hexdigest()[:16]

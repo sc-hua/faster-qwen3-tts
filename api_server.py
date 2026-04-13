@@ -189,6 +189,23 @@ def _validate_ref_audio_duration(path: str):
         )
 
 
+def _prepare_server_runtime() -> None:
+    """Clean leftover runtime cache and warm up the model before serving."""
+    cleanup = _voice_manager.startup_cleanup(clear_runtime_cache=True)
+    logger.info(
+        "Startup cache cleanup finished: removed %d registry entries, %d file(s)",
+        cleanup["removed_entries"],
+        cleanup["removed_files"],
+    )
+
+    if getattr(_model, "_warmed_up", False):
+        return
+
+    logger.info("Running startup warmup...")
+    _model._warmup(prefill_len=100)
+    logger.info("Startup warmup completed")
+
+
 # ── Streaming generator ─────────────────────────────────────────
 
 
@@ -512,6 +529,7 @@ def main():
         storage_dir=args.voices_dir,
         default_ttl=args.default_ttl,
     )
+    _prepare_server_runtime()
     logger.info(
         f"VoiceManager ready ({len(_voice_manager.list_voices())} voices, "
         f"storage={args.voices_dir})"
