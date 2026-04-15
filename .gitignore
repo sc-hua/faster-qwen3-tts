@@ -1,11 +1,21 @@
+# Audio files
 sample_*.wav
 *.wav
 !ref_audio.wav
-*.json
-__pycache__/
+
+# Python
 *.pyc
-.venv/
-.DS_Store
+__pycache__/
 *.egg-info/
+
+# Data and configuration
+*.json
 voices/
 ckpts
+
+# Environment and temporary files
+.tmp/
+.venv/
+
+# OS
+.DS_Store

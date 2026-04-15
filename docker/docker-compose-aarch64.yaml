@@ -36,3 +36,4 @@ services:
       --device cuda:0
       --dtype bfloat16
       --voices_dir /data/voices
+      --log_level debug
