@@ -37,6 +37,7 @@ def audio_to_pcm16_bytes(audio: np.ndarray) -> bytes:
 
     Uses the standard ``*32768 + clip`` approach for full dynamic range.
     """
+    np.nan_to_num(audio, copy=False, nan=0.0, posinf=1.0, neginf=-1.0)
     return np.clip(audio * 32768, -32768, 32767).astype(np.int16).tobytes()
 
 

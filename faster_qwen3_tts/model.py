@@ -27,8 +27,13 @@ def _audio_to_numpy(audio) -> np.ndarray:
     numpy array so callers don't need a per-element type check.
     """
     if hasattr(audio, "cpu"):
-        return audio.flatten().cpu().numpy()
-    return np.asarray(audio).flatten()
+        a = audio.flatten().cpu().numpy()
+    else:
+        a = np.asarray(audio).flatten()
+    if not np.all(np.isfinite(a)):
+        logger.warning("NaN/inf detected in decoded audio; replacing with silence")
+        np.nan_to_num(a, copy=False, nan=0.0, posinf=1.0, neginf=-1.0)
+    return a
 
 
 

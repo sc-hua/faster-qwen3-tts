@@ -883,6 +883,7 @@ class Qwen3TTSTokenizerV2Decoder(Qwen3TTSTokenizerV2DecoderPreTrainedModel):
         wav = hidden
         for block in self.decoder:
             wav = block(wav)
+        wav = torch.nan_to_num(wav, nan=0.0, posinf=1.0, neginf=-1.0)
         return wav.clamp(min=-1, max=1)
 
     def chunked_decode(self, codes, chunk_size=300, left_context_size=25):
@@ -1013,7 +1014,17 @@ class Qwen3TTSTokenizerV2Model(Qwen3TTSTokenizerV2PreTrainedModel):
         return_dict = return_dict if return_dict is not None else self.config.return_dict
         audio_lengths = (audio_codes[..., 0] > -1).sum(1) * self.decode_upsample_rate
 
-        audio_codes = torch.clamp(audio_codes, min=0)
+        cb_max = self.config.decoder_config.codebook_size - 1
+        oob_mask = (audio_codes > cb_max) | (audio_codes < -1)
+        if oob_mask.any():
+            n_oob = oob_mask.sum().item()
+            vals = audio_codes[oob_mask]
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "Clamping %d OOB codes (min=%d max=%d cb_max=%d) in shape %s",
+                n_oob, vals.min().item(), vals.max().item(), cb_max, list(audio_codes.shape),
+            )
+        audio_codes = torch.clamp(audio_codes, min=0, max=cb_max)
         audio_values = self.decoder.chunked_decode(audio_codes.transpose(1, 2)).squeeze(1)
 
         audio_values = [a[:l] for a, l in zip(audio_values, audio_lengths)]
