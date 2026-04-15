@@ -1,6 +1,6 @@
-"torch>=2.5.1"
+torch>=2.5.1
 torchaudio
-"transformers==4.57.3"
+transformers==4.57.3
 numpy
 soundfile
 librosa

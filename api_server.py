@@ -568,11 +568,16 @@ def main():
         f"storage={args.voices_dir})"
     )
 
+    # 强制使用 asyncio 事件循环而非 uvloop。uvloop 在 StreamingResponse 场景下
+    # 会攒多个小 write 到下一次 I/O poll 才 flush，而 TTS 生成是同步阻塞的，
+    # 导致事件循环一直拿不到控制权，多个 chunk 被攒在一起才发送，客户端 TTFA
+    # 从 ~300ms 飙升到 ~1s。使用默认 asyncio loop 则每次 yield 都能及时 flush。
     uvicorn.run(
         app,
         host=args.host,
         port=args.port,
         log_level=args.log_level,
+        loop="asyncio",
     )
 
 

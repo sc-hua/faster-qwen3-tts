@@ -6,7 +6,8 @@ services:
       args:
         - PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
         - APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
-        - BASE_IMAGE=python:3.12-slim-bookworm
+        - BASE_IMAGE=jetson-containers:r38.2.arm64-sbsa-cu130-24.04
+        # - BASE_IMAGE=ghcr.io/nvidia-ai-iot/vllm:0.16.0-g15d76f74e-r38.2-arm64-sbsa-cu130-24.04
       dockerfile: docker/Dockerfile
 
     image: realtime:faster-qwen3-tts-api
