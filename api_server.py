@@ -2,7 +2,7 @@
 FastAPI-based TTS API server with voice management.
 
 Provides OpenAI-compatible endpoints for text-to-speech synthesis
-and voice profile CRUD.
+and voice profile CRUD, compatible with vLLM-Omni's /v1/audio/speech and /v1/audio/voices API.
 
 Usage:
     python api_server.py --model_path Qwen/Qwen3-TTS-12Hz-1.7B-Base
@@ -33,6 +33,7 @@ from faster_qwen3_tts.audio_utils import (
     encode_audio,
     media_type,
 )
+from faster_qwen3_tts.voice_manager import MODE_ICL, MODE_XVEC
 
 logger = logging.getLogger(__name__)
 
@@ -98,9 +99,6 @@ class ErrorResponse(BaseModel):
 
 _REF_AUDIO_MIN_DURATION = 1.0  # seconds
 _REF_AUDIO_MAX_DURATION = 30.0  # seconds
-
-_MODE_XVEC = "xvec"
-_MODE_ICL = "icl"
 
 
 def _mime_to_ext(content_type: str) -> str:
@@ -402,14 +400,14 @@ def _validate_voice_name(name: str):
 async def create_voice(
     name: str = Form(..., description="Voice name"),
     ref_text: str = Form("", description="Transcript of the audio"),
-    mode: str = Form(_MODE_XVEC, description="xvec or icl"),
+    mode: str = Form(MODE_XVEC, description="xvec or icl"),
     audio_sample: UploadFile = File(..., description="Reference audio file"),
 ):
     """Register a new persistent voice from uploaded audio."""
     _validate_voice_name(name)
-    if mode not in (_MODE_XVEC, _MODE_ICL):
+    if mode not in (MODE_XVEC, MODE_ICL):
         raise HTTPException(400, "mode must be 'xvec' or 'icl'")
-    if mode == _MODE_ICL and not ref_text:
+    if mode == MODE_ICL and not ref_text:
         raise HTTPException(400, "ref_text is required for ICL mode")
 
     # Check name not taken
@@ -433,7 +431,7 @@ async def create_voice(
             name=name,
             ref_audio=tmp_path,
             ref_text=ref_text,
-            xvec_only=(mode == _MODE_XVEC),
+            xvec_only=(mode == MODE_XVEC),
         )
 
         return VoiceInfo.from_entry(entry).model_dump()

@@ -1,0 +1,11 @@
+"torch>=2.5.1"
+torchaudio
+"transformers==4.57.3"
+numpy
+soundfile
+librosa
+huggingface_hub
+uvicorn[standard]
+fastapi
+python-multipart
+accelerate

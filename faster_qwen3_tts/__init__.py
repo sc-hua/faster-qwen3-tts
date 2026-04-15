@@ -2,7 +2,7 @@
 faster-qwen3-tts: Real-time Qwen3-TTS inference using CUDA graphs
 """
 from .model import FasterQwen3TTS
-from .voice_manager import MODE_ICL, MODE_XVEC, VoiceEntry, VoiceManager
+from .voice_manager import VoiceManager
 
 __version__ = "0.2.5"
-__all__ = ["FasterQwen3TTS", "VoiceManager", "VoiceEntry", "MODE_XVEC", "MODE_ICL"]
+__all__ = ["FasterQwen3TTS", "VoiceManager"]

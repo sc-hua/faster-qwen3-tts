@@ -1201,6 +1201,7 @@ class FasterQwen3TTS:
             ref_codes=ref_codes,
         )
 
+    # TODO: remove custom voice task.
     @torch.inference_mode()
     def generate_custom_voice(
         self,
@@ -1256,6 +1257,7 @@ class FasterQwen3TTS:
 
         return self._decode_and_log(codec_ids, m.speech_tokenizer, timing)
 
+    # TODO: remove custom voice task.
     @torch.inference_mode()
     def generate_custom_voice_streaming(
         self,
@@ -1317,6 +1319,7 @@ class FasterQwen3TTS:
             chunk_size,
         )
 
+    # TODO: remove voice design task.
     @torch.inference_mode()
     def generate_voice_design(
         self,
@@ -1367,6 +1370,7 @@ class FasterQwen3TTS:
 
         return self._decode_and_log(codec_ids, m.speech_tokenizer, timing)
 
+    # TODO: remove voice design task.
     @torch.inference_mode()
     def generate_voice_design_streaming(
         self,
