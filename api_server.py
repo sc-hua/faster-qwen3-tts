@@ -212,11 +212,16 @@ async def _stream_tts(
     ref_audio_path: str,
 ) -> AsyncGenerator[bytes, None]:
     """Async generator for streaming TTS audio chunks."""
+    import time as _time
+
     fmt = request.response_format
     if fmt not in ("pcm", "wav"):
         fmt = "pcm"  # Streaming only supports pcm/wav
 
     first_chunk = True
+    stream_start = _time.monotonic()
+    chunk_idx = 0
+    total_audio_samples = 0
 
     async with _gpu_lock:
         gen = _model.generate_voice_clone_streaming(
@@ -238,11 +243,41 @@ async def _stream_tts(
             if audio_chunk is None or len(audio_chunk) == 0:
                 continue
 
-            if first_chunk and fmt == "wav":
-                yield create_wav_header(sr)
-                first_chunk = False
+            now = _time.monotonic()
+            elapsed = now - stream_start
+            total_audio_samples += len(audio_chunk)
+            audio_dur = total_audio_samples / sr if sr else 0
 
+            if first_chunk:
+                logger.debug(
+                    "TTFA=%.3fs | prefill=%.1fms gen=%.1fms codec_decode=? | chunk_samples=%d sr=%d",
+                    elapsed,
+                    timing.get('prefill_ms', 0),
+                    timing.get('decode_ms', 0),
+                    len(audio_chunk), sr,
+                )
+                if fmt == "wav":
+                    yield create_wav_header(sr)
+                first_chunk = False
+            else:
+                logger.debug(
+                    "chunk#%d t=%.3fs | gen=%.1fms | samples=%d audio_so_far=%.2fs RTF=%.2f",
+                    chunk_idx, elapsed,
+                    timing.get('decode_ms', 0),
+                    len(audio_chunk), audio_dur,
+                    audio_dur / elapsed if elapsed > 0 else 0,
+                )
+
+            chunk_idx += 1
             yield audio_to_pcm16_bytes(audio_chunk)
+
+        total_elapsed = _time.monotonic() - stream_start
+        total_audio_dur = total_audio_samples / sr if sr else 0
+        logger.debug(
+            "stream done: %d chunks, %.2fs audio in %.3fs wall (RTF=%.2f)",
+            chunk_idx, total_audio_dur, total_elapsed,
+            total_audio_dur / total_elapsed if total_elapsed > 0 else 0,
+        )
 
 
 # ── App lifecycle ────────────────────────────────────────────────

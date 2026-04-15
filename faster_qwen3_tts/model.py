@@ -208,6 +208,15 @@ class FasterQwen3TTS:
             all_flat = torch.cat(all_codes, dim=0)
             n_total = all_flat.shape[0]
 
+            # --- DEBUG: log codec token stats for this chunk ---
+            cmin = codec_chunk.min().item()
+            cmax = codec_chunk.max().item()
+            if cmax >= 2048 or cmin < 0:
+                logger.warning(
+                    "OOB codec tokens in chunk %d: shape=%s min=%d max=%d",
+                    timing.get('chunk_index', -1), codec_chunk.shape, cmin, cmax,
+                )
+
             if samples_per_frame is None:
                 # Phase 1: accumulated decode until we can calibrate.
                 if ref_codes is not None:
@@ -233,6 +242,16 @@ class FasterQwen3TTS:
                 new_audio = gen_audio[prev_gen_audio_len:]
                 prev_gen_audio_len = len(gen_audio)
 
+                # --- DEBUG: log audio stats after Phase 1 decode ---
+                if len(new_audio) > 0:
+                    amax = float(np.max(np.abs(new_audio)))
+                    nan_count = int(np.count_nonzero(~np.isfinite(new_audio)))
+                    if nan_count > 0 or amax > 1.0:
+                        logger.warning(
+                            "Phase1 audio stats: len=%d max_abs=%.4f nan_count=%d",
+                            len(new_audio), amax, nan_count,
+                        )
+
                 if n_total >= min_calibration_frames:
                     samples_per_frame = len(gen_audio) / n_total
             else:
@@ -251,6 +270,16 @@ class FasterQwen3TTS:
                     new_audio = audio[ctx_samples:]
                 else:
                     new_audio = audio
+
+                # --- DEBUG: log audio stats after Phase 2 decode ---
+                if len(new_audio) > 0:
+                    amax = float(np.max(np.abs(new_audio)))
+                    nan_count = int(np.count_nonzero(~np.isfinite(new_audio)))
+                    if nan_count > 0 or amax > 1.0:
+                        logger.warning(
+                            "Phase2 audio stats: len=%d max_abs=%.4f nan_count=%d window=%d ctx=%d",
+                            len(new_audio), amax, nan_count, window.shape[0], n_ctx,
+                        )
 
             yield new_audio, sr, timing
 
