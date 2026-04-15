@@ -6,5 +6,9 @@ __pycache__
 *.pyc
 *.pyo
 
-voices
-tests
+*.md
+./docker
+./ckpts
+./voices
+./tests
+./.tmp/

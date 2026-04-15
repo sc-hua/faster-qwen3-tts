@@ -24,7 +24,6 @@ services:
     volumes:
       - /etc/localtime:/etc/localtime:ro
       - /etc/timezone:/etc/timezone:ro
-      - ~/.cache/huggingface:/root/.cache/huggingface
       - ../voices:/data/voices
       - ../ckpts:/root/ckpts
       
