@@ -69,6 +69,7 @@ class SpeechRequest(BaseModel):
     top_p: float = Field(1.0, ge=0.0, le=1.0)
     max_new_tokens: int = Field(2048, ge=1)
     repetition_penalty: float = Field(1.05, ge=1.0)
+    eos_logit_bias: float = Field(0.0, description="Additive bias on the EOS logit (positive = shorter, negative = longer)")
     instruct: Optional[str] = Field(None, description="Style/dialect instruction")
     chunk_size: int = Field(12, ge=1, description="Codec frames per streaming chunk")
 
@@ -237,6 +238,7 @@ async def _stream_tts(
             repetition_penalty=request.repetition_penalty,
             chunk_size=request.chunk_size,
             instruct=request.instruct,
+            eos_logit_bias=request.eos_logit_bias,
         )
 
         for audio_chunk, sr, timing in gen:
@@ -379,6 +381,7 @@ async def create_speech(request: SpeechRequest):
                 max_new_tokens=request.max_new_tokens,
                 repetition_penalty=request.repetition_penalty,
                 instruct=request.instruct,
+                eos_logit_bias=request.eos_logit_bias,
             )
 
         audio = audio_list[0]

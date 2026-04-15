@@ -7,6 +7,22 @@ import torch
 import torch.nn.functional as F
 
 
+def build_codec_suppress_mask(
+    vocab_size: int,
+    codebook_vocab_size: int,
+    eos_id: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Build a boolean mask that suppresses all tokens outside [1, codebook_vocab_size) ∪ {eos_id}."""
+    allowed = torch.zeros(vocab_size, dtype=torch.bool, device=device)
+    hi = min(codebook_vocab_size, vocab_size)
+    if hi > 1:
+        allowed[1:hi] = True
+    if 0 <= eos_id < vocab_size:
+        allowed[eos_id] = True
+    return ~allowed
+
+
 def apply_repetition_penalty(
     logits: torch.Tensor,
     token_history: torch.Tensor,
@@ -38,16 +54,20 @@ def sample_logits(
     do_sample: bool,
     suppress_mask: Optional[torch.Tensor] = None,
     suppress_tokens: Optional[Iterable[int]] = None,
+    eos_logit_bias: float = 0.0,
+    eos_id: int = -1,
 ) -> torch.Tensor:
     """Sample a token from logits.
 
-    Mirrors HF order: suppress -> temperature -> top-k -> top-p -> sample.
+    Mirrors HF order: suppress -> eos_bias -> temperature -> top-k -> top-p -> sample.
     """
     logits = logits.clone()
     if suppress_mask is not None:
         logits[..., suppress_mask] = float("-inf")
     if suppress_tokens:
         logits[..., list(suppress_tokens)] = float("-inf")
+    if eos_logit_bias != 0.0 and 0 <= eos_id < logits.shape[-1]:
+        logits[..., eos_id] = logits[..., eos_id] + eos_logit_bias
     if not do_sample:
         return torch.argmax(logits, dim=-1)
     logits = logits / temperature

@@ -1053,6 +1053,7 @@ class FasterQwen3TTS:
         append_silence: bool = True,
         instruct: Optional[str] = None,
         voice_clone_prompt: Optional[Union[Dict[str, Any], List[Any]]] = None,
+        eos_logit_bias: float = 0.0,
     ) -> Tuple[list, int]:
         """
         Generate speech with voice cloning using reference audio.
@@ -1117,6 +1118,7 @@ class FasterQwen3TTS:
             top_p=top_p,
             do_sample=do_sample,
             repetition_penalty=repetition_penalty,
+            eos_logit_bias=eos_logit_bias,
         )
 
         return self._decode_and_log(
@@ -1144,6 +1146,7 @@ class FasterQwen3TTS:
         parity_mode: bool = False,
         instruct: Optional[str] = None,
         voice_clone_prompt: Optional[Union[Dict[str, Any], List[Any]]] = None,
+        eos_logit_bias: float = 0.0,
     ) -> Generator[Tuple[np.ndarray, int, dict], None, None]:
         """
         Stream voice-cloned speech generation, yielding audio chunks.
@@ -1215,6 +1218,7 @@ class FasterQwen3TTS:
             do_sample=do_sample,
             repetition_penalty=repetition_penalty,
             chunk_size=chunk_size,
+            eos_logit_bias=eos_logit_bias,
         )
         if not parity_mode:
             stream_kwargs["predictor_graph"] = self.predictor_graph

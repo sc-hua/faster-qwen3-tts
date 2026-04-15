@@ -8,7 +8,7 @@ from typing import Optional, Tuple
 import torch
 
 from .predictor_graph import PredictorGraph
-from .sampling import apply_repetition_penalty, sample_logits
+from .sampling import apply_repetition_penalty, build_codec_suppress_mask, sample_logits
 from .talker_graph import TalkerGraph
 
 
@@ -34,6 +34,7 @@ def fast_generate(
     subtalker_top_p: Optional[float] = None,
     subtalker_temperature: Optional[float] = None,
     parity_mode: bool = False,
+    eos_logit_bias: float = 0.0,
 ) -> Tuple[Optional[torch.Tensor], dict]:
     """
     Fast autoregressive generation with CUDA-graphed predictor and talker.
@@ -41,16 +42,13 @@ def fast_generate(
     eos_id = config.codec_eos_token_id
     num_code_groups = config.num_code_groups
     vocab_size = config.vocab_size
+    codebook_vocab_size = config.code_predictor_config.vocab_size
     device = talker_input_embeds.device
     
-    suppress_mask = torch.zeros(vocab_size, dtype=torch.bool, device=device)
-    suppress_start = max(0, vocab_size - 1024)
-    for i in range(suppress_start, vocab_size):
-        if i != eos_id:
-            suppress_mask[i] = True
+    suppress_mask = build_codec_suppress_mask(vocab_size, codebook_vocab_size, eos_id, device)
 
     if parity_mode:
-        suppress_tokens = [i for i in range(suppress_start, vocab_size) if i != eos_id]
+        suppress_tokens = [i for i in range(vocab_size) if not (1 <= i < codebook_vocab_size) and i != eos_id]
         t_start = time.time()
         talker_result = talker.generate(
             inputs_embeds=talker_input_embeds,
@@ -131,6 +129,8 @@ def fast_generate(
         do_sample=do_sample,
         suppress_mask=suppress_mask,
         suppress_tokens=[eos_id] if suppress_eos else None,
+        eos_logit_bias=eos_logit_bias,
+        eos_id=eos_id,
     )
     
     # Copy prefill KV cache into talker graph's static cache
@@ -157,6 +157,9 @@ def fast_generate(
         
         # Build full codec: [first_cb, cb1, ..., cb15]
         all_cb = torch.cat([token.view(1), codebook_token_ids])  # [16]
+        layer0 = token.item()
+        if not (1 <= layer0 < codebook_vocab_size):
+            all_cb.zero_()
         all_codec_ids.append(all_cb.detach())
         
         # --- Build input embedding for talker ---
@@ -194,6 +197,8 @@ def fast_generate(
             do_sample=do_sample,
             suppress_mask=suppress_mask,
             suppress_tokens=[eos_id] if suppress_eos else None,
+            eos_logit_bias=eos_logit_bias,
+            eos_id=eos_id,
         )
         past_hidden = hidden_states[:, -1:, :].clone()  # clone since it's the static buffer
         gen_step += 1
