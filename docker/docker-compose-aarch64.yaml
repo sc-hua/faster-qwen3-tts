@@ -1,0 +1,37 @@
+name: realtime
+services:
+  faster-qwen3-tts-api:
+    build:
+      context: ..
+      args:
+        - PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+        - APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
+        - BASE_IMAGE=python:3.12-slim-bookworm
+      dockerfile: docker/Dockerfile
+
+    image: realtime:faster-qwen3-tts-api
+    container_name: faster-qwen3-tts-api
+    restart: unless-stopped
+    gpus: all
+
+    ports:
+      - "23456:8000"
+
+    environment:
+      - TZ=Asia/Shanghai
+
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+      - ~/.cache/huggingface:/root/.cache/huggingface
+      - ../voices:/data/voices
+      - ../ckpts:/root/ckpts
+      
+    command: >
+      python api_server.py
+      --model_path /root/ckpts/Qwen3-TTS-12Hz-0_6B-Base
+      --host 0.0.0.0
+      --port 8000
+      --device cuda:0
+      --dtype bfloat16
+      --voices_dir /data/voices
