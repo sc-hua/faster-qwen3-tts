@@ -108,8 +108,8 @@ canvas { width: 100%; height: 80px; background: #16213e; border-radius: 8px; dis
 <script>
 // --- State ---
 let audioCtx = null;
-let reader = null;
-let aborted = false;
+let currentRun = null;
+let runSeq = 0;
 let nextStartTime = 0;
 let sourceNodes = [];
 let analyser = null;
@@ -118,7 +118,6 @@ let startTime = 0;
 let totalBytes = 0;
 let sampleRate = 24000;
 let ttfa = null;
-let elapsedTimer = null;
 
 // --- DOM refs ---
 const btnGen = document.getElementById('btnGenerate');
@@ -130,6 +129,13 @@ const ctx = canvas.getContext('2d');
 
 // --- Helpers ---
 function setStatus(msg) { statusEl.textContent = msg; }
+
+function isAbortError(err) {
+  return !!err && (
+    err.name === 'AbortError' ||
+    String(err.message || '').toLowerCase().includes('abort')
+  );
+}
 
 function fmtBytes(n) {
   if (n < 1024) return n + ' B';
@@ -222,17 +228,26 @@ function scheduleChunk(audioBuffer) {
 }
 
 // --- Stop playback and streaming ---
-function stopAll() {
-  aborted = true;
-  if (reader) { reader.cancel().catch(() => {}); reader = null; }
+async function stopAll({ silent = false } = {}) {
+  const run = currentRun;
+  currentRun = null;
+
+  if (run) {
+    run.stopped = true;
+    if (run.controller) run.controller.abort();
+    if (run.reader) {
+      try { await run.reader.cancel(); } catch (e) {}
+      run.reader = null;
+    }
+  }
+
   sourceNodes.forEach(s => { try { s.stop(); s.disconnect(); } catch(e) {} });
   sourceNodes = [];
   if (animFrameId) { cancelAnimationFrame(animFrameId); animFrameId = null; }
-  if (elapsedTimer) { clearInterval(elapsedTimer); elapsedTimer = null; }
   btnGen.disabled = false;
   btnNonStream.disabled = false;
   btnStop.disabled = true;
-  setStatus('Stopped');
+  if (!silent) setStatus('Stopped');
 }
 
 // --- Helper: read common inputs ---
@@ -261,8 +276,7 @@ async function generate() {
   const payload = buildPayload(inputs, true);
 
   // Reset state
-  stopAll();
-  aborted = false;
+  await stopAll({ silent: true });
   resetStats();
   btnGen.disabled = true;
   btnNonStream.disabled = true;
@@ -284,7 +298,16 @@ async function generate() {
   drawWaveform();
 
   startTime = performance.now();
-  elapsedTimer = setInterval(updateStats, 200);
+  const run = {
+    id: ++runSeq,
+    controller: new AbortController(),
+    reader: null,
+    stopped: false,
+  };
+  currentRun = run;
+  const statsTimer = setInterval(() => {
+    if (currentRun === run && !run.stopped) updateStats();
+  }, 200);
 
   let leftover = new Uint8Array(0);
 
@@ -293,6 +316,7 @@ async function generate() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
+      signal: run.controller.signal,
     });
 
     if (!resp.ok) {
@@ -304,11 +328,11 @@ async function generate() {
     document.getElementById('statSR').textContent = sampleRate + ' Hz';
     setStatus('Streaming...');
 
-    reader = resp.body.getReader();
+    run.reader = resp.body.getReader();
 
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done || aborted) break;
+    while (currentRun === run && !run.stopped) {
+      const { done, value } = await run.reader.read();
+      if (done || currentRun !== run || run.stopped) break;
 
       // Record TTFA on first chunk
       if (ttfa === null) {
@@ -333,7 +357,7 @@ async function generate() {
       }
     }
 
-    if (!aborted) {
+    if (currentRun === run && !run.stopped) {
       updateStats();
       setStatus('Done — audio playing');
       btnGen.disabled = false;
@@ -341,15 +365,18 @@ async function generate() {
       btnStop.disabled = false;
     }
   } catch (err) {
-    if (!aborted) {
+    if (currentRun === run && !run.stopped && !isAbortError(err)) {
       setStatus('Error: ' + err.message);
       btnGen.disabled = false;
       btnNonStream.disabled = false;
       btnStop.disabled = true;
     }
   } finally {
-    reader = null;
-    if (elapsedTimer) { clearInterval(elapsedTimer); elapsedTimer = null; }
+    clearInterval(statsTimer);
+    if (run.reader) run.reader = null;
+    if (currentRun === run) {
+      currentRun = null;
+    }
   }
 }
 
@@ -359,11 +386,11 @@ async function generateNonStream() {
   if (!inputs.text) { setStatus('Please enter some text'); return; }
   const payload = buildPayload(inputs, false);
 
-  stopAll();
-  aborted = false;
+  await stopAll({ silent: true });
   resetStats();
   btnGen.disabled = true;
   btnNonStream.disabled = true;
+  btnStop.disabled = false;
   setStatus('Generating (non-stream)...');
 
   if (!audioCtx || audioCtx.state === 'closed') audioCtx = new AudioContext();
@@ -375,12 +402,20 @@ async function generateNonStream() {
   drawWaveform();
 
   startTime = performance.now();
+  const run = {
+    id: ++runSeq,
+    controller: new AbortController(),
+    reader: null,
+    stopped: false,
+  };
+  currentRun = run;
 
   try {
     const resp = await fetch(`${inputs.server}/v1/audio/speech`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
+      signal: run.controller.signal,
     });
     if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${await resp.text()}`);
 
@@ -397,12 +432,20 @@ async function generateNonStream() {
     scheduleChunk(audioBuffer);
 
     updateStats();
-    setStatus('Done — audio playing');
+    if (currentRun === run && !run.stopped) {
+      setStatus('Done — audio playing');
+    }
   } catch (err) {
-    setStatus('Error: ' + err.message);
+    if (currentRun === run && !run.stopped && !isAbortError(err)) {
+      setStatus('Error: ' + err.message);
+    }
   } finally {
-    btnGen.disabled = false;
-    btnNonStream.disabled = false;
+    if (currentRun === run) {
+      currentRun = null;
+      btnGen.disabled = false;
+      btnNonStream.disabled = false;
+      btnStop.disabled = true;
+    }
   }
 }
 
@@ -477,11 +520,11 @@ document.getElementById('fileRefAudio').addEventListener('change', function(e) {
 });
 
 // --- Event listeners ---
-btnGen.addEventListener('click', generate);
-btnNonStream.addEventListener('click', generateNonStream);
+btnGen.addEventListener('click', () => { void generate(); });
+btnNonStream.addEventListener('click', () => { void generateNonStream(); });
 document.getElementById('btnAddSpeaker').addEventListener('click', addSpeaker);
 document.getElementById('btnListSpeakers').addEventListener('click', listSpeakers);
-btnStop.addEventListener('click', stopAll);
+btnStop.addEventListener('click', () => { void stopAll(); });
 window.addEventListener('resize', () => { if (animFrameId) initCanvas(); });
 </script>
 </body>

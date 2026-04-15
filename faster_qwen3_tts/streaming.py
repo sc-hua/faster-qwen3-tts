@@ -5,8 +5,9 @@ Streaming generation with CUDA graphs for both predictor and talker.
 Yields codec ID chunks during generation instead of collecting all at once.
 CUDA graph usage is identical to non-streaming — same per-step performance.
 """
+import threading
 import time
-from typing import Generator, Tuple
+from typing import Generator, Optional, Tuple
 
 import torch
 
@@ -34,6 +35,7 @@ def fast_generate_streaming(
     repetition_penalty: float = 1.05,
     chunk_size: int = 12,
     eos_logit_bias: float = 0.0,
+    cancel_event: Optional[threading.Event] = None,
 ) -> Generator[Tuple[torch.Tensor, dict], None, None]:
     """
     Streaming autoregressive generation with CUDA-graphed predictor and talker.
@@ -56,6 +58,8 @@ def fast_generate_streaming(
     predictor_codec_embeds = predictor.get_input_embeddings()
 
     # === PREFILL (still uses HF forward for variable-length prefill) ===
+    if cancel_event is not None and cancel_event.is_set():
+        return
     t_start = time.time()
 
     out = talker.forward(
@@ -105,6 +109,8 @@ def fast_generate_streaming(
 
     for step_idx in range(max_new_tokens):
         if token.item() == eos_id:
+            break
+        if cancel_event is not None and cancel_event.is_set():
             break
 
         # --- CUDA-Graphed Code Predictor ---
@@ -210,6 +216,7 @@ def parity_generate_streaming(
     repetition_penalty: float = 1.05,
     chunk_size: int = 12,
     eos_logit_bias: float = 0.0,
+    cancel_event: Optional[threading.Event] = None,
 ) -> Generator[Tuple[torch.Tensor, dict], None, None]:
     """
     Streaming generation without CUDA graphs (dynamic cache).
@@ -228,6 +235,8 @@ def parity_generate_streaming(
     suppress_mask = build_codec_suppress_mask(vocab_size, codebook_vocab_size, eos_id, device)
 
     # === PREFILL ===
+    if cancel_event is not None and cancel_event.is_set():
+        return
     t_start = time.time()
 
     out = talker.forward(
@@ -276,6 +285,8 @@ def parity_generate_streaming(
 
     for _ in range(max_new_tokens):
         if token.item() == eos_id:
+            break
+        if cancel_event is not None and cancel_event.is_set():
             break
 
         cache_position = None

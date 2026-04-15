@@ -14,13 +14,15 @@ import base64
 import logging
 import re
 import tempfile
+import threading
 
 import urllib.request
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import AsyncGenerator, Optional
 
+import numpy as np
 import soundfile as sf
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -42,6 +44,7 @@ logger = logging.getLogger(__name__)
 _model = None  # FasterQwen3TTS
 _voice_manager = None  # VoiceManager
 _gpu_lock = asyncio.Lock()  # Serialize GPU inference
+_active_cancel_flag: threading.Event | None = None  # Cancel flag of in-flight request
 
 
 # ── Pydantic schemas ────────────────────────────────────────────
@@ -205,26 +208,100 @@ def _prepare_server_runtime() -> None:
     logger.info("Startup warmup completed")
 
 
+async def _listen_for_disconnect(
+    raw_request: Request,
+    cancel_flag: threading.Event,
+) -> None:
+    """Flip ``cancel_flag`` when the client closes the HTTP connection."""
+    while True:
+        msg = await raw_request.receive()
+        if msg["type"] == "http.disconnect":
+            cancel_flag.set()
+            return
+
+
+def _start_disconnect_watcher(
+    raw_request: Request,
+) -> tuple[threading.Event, asyncio.Task]:
+    """Start a single request-scoped disconnect watcher."""
+    cancel_flag = threading.Event()
+    watcher = asyncio.create_task(_listen_for_disconnect(raw_request, cancel_flag))
+    return cancel_flag, watcher
+
+
+async def _stop_disconnect_watcher(watcher: asyncio.Task | None) -> None:
+    """Stop a request-scoped disconnect watcher."""
+    if watcher is None:
+        return
+    watcher.cancel()
+    with suppress(asyncio.CancelledError):
+        await watcher
+
+
+async def _acquire_gpu_lock_or_abort(cancel_flag: threading.Event) -> bool:
+    """Acquire the GPU lock unless the request is already aborted."""
+    acquire_task = asyncio.create_task(_gpu_lock.acquire())
+    cancel_waiter = asyncio.create_task(asyncio.to_thread(cancel_flag.wait))
+
+    try:
+        done, _pending = await asyncio.wait(
+            {acquire_task, cancel_waiter},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if acquire_task in done:
+            if cancel_flag.is_set():
+                _gpu_lock.release()
+                return False
+            return True
+
+        acquire_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await acquire_task
+        return False
+    finally:
+        cancel_waiter.cancel()
+        with suppress(asyncio.CancelledError):
+            await cancel_waiter
+
+
 # ── Streaming generator ─────────────────────────────────────────
 
 
 async def _stream_tts(
     request: SpeechRequest,
     ref_audio_path: str,
+    cancel_flag: threading.Event,
+    watcher: asyncio.Task,
 ) -> AsyncGenerator[bytes, None]:
-    """Async generator for streaming TTS audio chunks."""
+    """Async generator for streaming TTS audio chunks.
+
+    The sync generator ``gen`` blocks the event loop during each GPU step,
+    preventing uvicorn from detecting TCP disconnects.  We therefore run
+    ``next(gen)`` in a thread-pool executor so the event loop stays free,
+    and a background watcher task polls ``is_disconnected()`` concurrently.
+    """
     import time as _time
 
     fmt = request.response_format
     if fmt not in ("pcm", "wav"):
-        fmt = "pcm"  # Streaming only supports pcm/wav
+        fmt = "pcm"
 
     first_chunk = True
     stream_start = _time.monotonic()
     chunk_idx = 0
     total_audio_samples = 0
+    sr = getattr(_model, "sample_rate", 24000)
+    gen = None
+    lock_acquired = False
+    _sentinel = object()
+    _pending_future = None
+    loop = asyncio.get_running_loop()
+    if not await _acquire_gpu_lock_or_abort(cancel_flag):
+        logger.info("Stream aborted before GPU lock acquisition")
+        return
 
-    async with _gpu_lock:
+    lock_acquired = True
+    try:
         gen = _model.generate_voice_clone_streaming(
             text=request.input,
             language=request.language,
@@ -239,57 +316,141 @@ async def _stream_tts(
             chunk_size=request.chunk_size,
             instruct=request.instruct,
             eos_logit_bias=request.eos_logit_bias,
+            cancel_event=cancel_flag,
         )
 
-        for audio_chunk, sr, timing in gen:
-            if audio_chunk is None or len(audio_chunk) == 0:
-                continue
+        def _next_sync():
+            try:
+                return next(gen)
+            except StopIteration:
+                return _sentinel
 
-            now = _time.monotonic()
-            elapsed = now - stream_start
-            total_audio_samples += len(audio_chunk)
-            audio_dur = total_audio_samples / sr if sr else 0
+        try:
+            while True:
+                _pending_future = loop.run_in_executor(None, _next_sync)
+                result = await _pending_future
+                _pending_future = None
+                if result is _sentinel or cancel_flag.is_set():
+                    break
+                audio_chunk, sr, timing = result
 
-            if first_chunk:
-                logger.debug(
-                    "TTFA=%.3fs | prefill=%.1fms gen=%.1fms codec_decode=? | chunk_samples=%d sr=%d",
-                    elapsed,
-                    timing.get('prefill_ms', 0),
-                    timing.get('decode_ms', 0),
-                    len(audio_chunk), sr,
-                )
-                if fmt == "wav":
-                    yield create_wav_header(sr)
-                first_chunk = False
-            else:
-                logger.debug(
-                    "chunk#%d t=%.3fs | gen=%.1fms | samples=%d audio_so_far=%.2fs RTF=%.2f",
-                    chunk_idx, elapsed,
-                    timing.get('decode_ms', 0),
-                    len(audio_chunk), audio_dur,
-                    audio_dur / elapsed if elapsed > 0 else 0,
-                )
+                if audio_chunk is None or len(audio_chunk) == 0:
+                    continue
 
-            chunk_idx += 1
-            yield audio_to_pcm16_bytes(audio_chunk)
+                now = _time.monotonic()
+                elapsed = now - stream_start
+                total_audio_samples += len(audio_chunk)
+                audio_dur = total_audio_samples / sr if sr else 0
 
-        total_elapsed = _time.monotonic() - stream_start
-        total_audio_dur = total_audio_samples / sr if sr else 0
-        logger.debug(
-            "stream done: %d chunks, %.2fs audio in %.3fs wall (RTF=%.2f)",
-            chunk_idx, total_audio_dur, total_elapsed,
-            total_audio_dur / total_elapsed if total_elapsed > 0 else 0,
-        )
+                if first_chunk:
+                    logger.debug(
+                        "TTFA=%.3fs | prefill=%.1fms gen=%.1fms codec_decode=? | chunk_samples=%d sr=%d",
+                        elapsed,
+                        timing.get('prefill_ms', 0),
+                        timing.get('decode_ms', 0),
+                        len(audio_chunk), sr,
+                    )
+                    if fmt == "wav":
+                        yield create_wav_header(sr)
+                    first_chunk = False
+                else:
+                    logger.debug(
+                        "chunk#%d t=%.3fs | gen=%.1fms | samples=%d audio_so_far=%.2fs RTF=%.2f",
+                        chunk_idx, elapsed,
+                        timing.get('decode_ms', 0),
+                        len(audio_chunk), audio_dur,
+                        audio_dur / elapsed if elapsed > 0 else 0,
+                    )
+
+                chunk_idx += 1
+                yield audio_to_pcm16_bytes(audio_chunk)
+        finally:
+            client_disconnected = cancel_flag.is_set()
+
+        if client_disconnected:
+            logger.info("Stream aborted: client disconnected after %d chunks", chunk_idx)
+        else:
+            total_elapsed = _time.monotonic() - stream_start
+            total_audio_dur = total_audio_samples / sr if sr else 0
+            logger.debug(
+                "stream done: %d chunks, %.2fs audio in %.3fs wall (RTF=%.2f)",
+                chunk_idx, total_audio_dur, total_elapsed,
+                total_audio_dur / total_elapsed if total_elapsed > 0 else 0,
+            )
+    except GeneratorExit:
+        logger.warning("Stream aborted: generator closed")
+    except asyncio.CancelledError:
+        logger.warning("Stream aborted: task cancelled")
+        # Do NOT re-raise: propagating CancelledError out of an async
+        # generator crashes Starlette's internal TaskGroup.  Just let
+        # the generator end; the finally block handles cleanup.
+    finally:
+        global _active_cancel_flag
+        cancel_flag.set()
+        if _active_cancel_flag is cancel_flag:
+            _active_cancel_flag = None
+
+        def _do_cleanup():
+            """Close generator + release GPU lock (must run on event-loop thread)."""
+            if gen is not None:
+                try:
+                    gen.close()
+                except (ValueError, RuntimeError):
+                    pass
+            if lock_acquired:
+                _gpu_lock.release()
+            elapsed = _time.monotonic() - stream_start
+            logger.debug("_stream_tts cleanup: GPU lock released after %.3fs", elapsed)
+
+        if _pending_future is not None and not _pending_future.done():
+            # Thread pool is still executing next(gen).  Defer cleanup
+            # until the thread finishes so we don't call gen.close()
+            # while the generator is executing, and don't release the
+            # GPU lock while the GPU is still in use.
+            _pending_future.add_done_callback(lambda _fut: _do_cleanup())
+        else:
+            _do_cleanup()
+
+        # Cancel disconnect watcher (fire-and-forget; no await needed)
+        if watcher is not None:
+            watcher.cancel()
 
 
 # ── App lifecycle ────────────────────────────────────────────────
 
 
+import torch as _torch
+
+# Jetson Thor 的 CUDA runtime 在 GPU 空闲 ~10-15 秒后会进入休眠状态，
+# 此后第一次 GPU 操作（哪怕只是一个小 tensor 的 .to(cuda)）需要 ~2 秒唤醒。
+# 这不是 GPU 时钟降频问题（jetson_clocks 锁频无效），而是 driver 层面的行为。
+# 受影响的调用链：_tokenize_texts → processor() → input_ids.to(device)，
+# 这一步位于 model.py 的 _prepare_generation() 中。
+# 通过每隔几秒对一个 GPU tensor 做一次 add_ 操作来保持 CUDA context 活跃。
+_KEEPALIVE_INTERVAL = 5  # seconds between CUDA keepalive pings
+_keepalive_tensor = None  # tiny tensor pre-allocated on GPU
+
+
+async def _cuda_keepalive():
+    """Periodically nudge the GPU to prevent CUDA context from sleeping."""
+    global _keepalive_tensor
+    while True:
+        await asyncio.sleep(_KEEPALIVE_INTERVAL)
+        if _keepalive_tensor is not None:
+            _keepalive_tensor.add_(1)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: model is loaded in main() before uvicorn.run
+    global _keepalive_tensor
+    if _model is not None:
+        device = next(_model.model.model.parameters()).device
+        _keepalive_tensor = _torch.zeros(1, device=device)
+    task = asyncio.create_task(_cuda_keepalive())
     yield
-    # Shutdown: nothing to clean up
+    task.cancel()
+    with suppress(asyncio.CancelledError):
+        await task
 
 
 app = FastAPI(
@@ -313,13 +474,22 @@ app.add_middleware(
 
 
 @app.post("/v1/audio/speech")
-async def create_speech(request: SpeechRequest):
+async def create_speech(request: SpeechRequest, raw_request: Request):
     """Synthesize speech from text.
 
     Provide either `voice` (registered name) or `ref_audio` (inline audio).
     """
+    global _active_cancel_flag
     ref_audio_path = None
     cleanup_path = None
+    cancel_flag, watcher = _start_disconnect_watcher(raw_request)
+    watcher_owned_by_stream = False
+
+    # Auto-cancel any in-flight inference so the new request doesn't queue.
+    prev = _active_cancel_flag
+    if prev is not None:
+        prev.set()
+    _active_cancel_flag = cancel_flag
 
     try:
         # Validate ICL mode requires ref_text
@@ -358,8 +528,12 @@ async def create_speech(request: SpeechRequest):
             fmt = request.response_format
             if fmt not in ("pcm", "wav"):
                 fmt = "pcm"
+            if cancel_flag.is_set():
+                logger.info("Streaming request aborted before response started")
+                return Response(status_code=499)
+            watcher_owned_by_stream = True
             return StreamingResponse(
-                _stream_tts(request, ref_audio_path),
+                _stream_tts(request, ref_audio_path, cancel_flag, watcher),
                 media_type=media_type(fmt),
                 headers={
                     "X-Sample-Rate": str(_model.sample_rate),
@@ -367,9 +541,21 @@ async def create_speech(request: SpeechRequest):
                 },
             )
 
-        # Non-streaming response
-        async with _gpu_lock:
-            audio_list, sr = _model.generate_voice_clone(
+        # Non-streaming response — use streaming generator internally
+        # so that client disconnect can abort GPU inference between chunks.
+        audio_chunks = []
+        sr = getattr(_model, "sample_rate", 24000)
+        gen = None
+        lock_acquired = False
+        _sentinel = object()
+        loop = asyncio.get_running_loop()
+        if not await _acquire_gpu_lock_or_abort(cancel_flag):
+            logger.info("Non-streaming request aborted before GPU lock acquisition")
+            return Response(status_code=499)
+
+        lock_acquired = True
+        try:
+            gen = _model.generate_voice_clone_streaming(
                 text=request.input,
                 language=request.language,
                 ref_audio=ref_audio_path,
@@ -380,11 +566,44 @@ async def create_speech(request: SpeechRequest):
                 top_p=request.top_p,
                 max_new_tokens=request.max_new_tokens,
                 repetition_penalty=request.repetition_penalty,
+                chunk_size=request.chunk_size,
                 instruct=request.instruct,
                 eos_logit_bias=request.eos_logit_bias,
+                cancel_event=cancel_flag,
             )
 
-        audio = audio_list[0]
+            def _next_sync():
+                try:
+                    return next(gen)
+                except StopIteration:
+                    return _sentinel
+
+            try:
+                while True:
+                    result = await loop.run_in_executor(None, _next_sync)
+                    if result is _sentinel or cancel_flag.is_set():
+                        break
+                    chunk, chunk_sr, _timing = result
+                    if chunk is not None and len(chunk) > 0:
+                        audio_chunks.append(chunk)
+                        sr = chunk_sr
+            finally:
+                client_disconnected = cancel_flag.is_set()
+
+            if client_disconnected:
+                logger.info("Non-streaming request aborted: client disconnected")
+                return Response(status_code=499)
+        finally:
+            cancel_flag.set()
+            if gen is not None:
+                gen.close()
+            if lock_acquired:
+                _gpu_lock.release()
+
+        if not audio_chunks:
+            raise HTTPException(500, "Generation produced no audio")
+
+        audio = np.concatenate(audio_chunks)
         audio_bytes = encode_audio(audio, sr, request.response_format)
 
         return Response(
@@ -397,6 +616,11 @@ async def create_speech(request: SpeechRequest):
         )
 
     finally:
+        if not watcher_owned_by_stream:
+            cancel_flag.set()
+            if _active_cancel_flag is cancel_flag:
+                _active_cancel_flag = None
+            await _stop_disconnect_watcher(watcher)
         if cleanup_path:
             Path(cleanup_path).unlink(missing_ok=True)
 
@@ -534,9 +758,7 @@ def parse_args():
         default=3600.0,
         help="Default TTL for cached voices (seconds)",
     )
-    parser.add_argument(
-        "--log_level", default="info", help="Log level"
-    )
+    parser.add_argument("--log_level", default="info", help="Log level")
     return parser.parse_args()
 
 
@@ -557,6 +779,9 @@ def main():
         args.model_path,
         device=args.device,
         dtype=args.dtype,
+        # we use sdpa, flash attention 2 is not compatible with CUDA graphs
+        # btw, flash-attn cost almost the same as sdpa, so no quality/speed tradeoff here
+        attn_implementation="sdpa",
     )
     logger.info("Model loaded")
 

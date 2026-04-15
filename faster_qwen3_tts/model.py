@@ -6,6 +6,7 @@ CUDA graphs for 6-10x speedup.
 """
 import collections
 import logging
+import threading
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional, Tuple, Union
 
@@ -1147,6 +1148,7 @@ class FasterQwen3TTS:
         instruct: Optional[str] = None,
         voice_clone_prompt: Optional[Union[Dict[str, Any], List[Any]]] = None,
         eos_logit_bias: float = 0.0,
+        cancel_event: Optional[threading.Event] = None,
     ) -> Generator[Tuple[np.ndarray, int, dict], None, None]:
         """
         Stream voice-cloned speech generation, yielding audio chunks.
@@ -1188,6 +1190,8 @@ class FasterQwen3TTS:
         """
         from .streaming import fast_generate_streaming, parity_generate_streaming
 
+        import time as _time
+        _t_prep_start = _time.monotonic()
         m, talker, config, tie, tam, tth, tpe, ref_codes = self._prepare_generation(
             text=text,
             language=language,
@@ -1199,8 +1203,14 @@ class FasterQwen3TTS:
             voice_clone_prompt=voice_clone_prompt,
             instruct=instruct,
         )
+        _t_prep = _time.monotonic() - _t_prep_start
 
         speech_tokenizer = m.speech_tokenizer
+        logger.debug("prepare_generation: %.1fms | tie=%s tth=%s",
+                      _t_prep * 1000, tie.shape, tth.shape)
+
+        if cancel_event is not None and cancel_event.is_set():
+            return
 
         stream_fn = parity_generate_streaming if parity_mode else fast_generate_streaming
         stream_kwargs = dict(
@@ -1219,6 +1229,7 @@ class FasterQwen3TTS:
             repetition_penalty=repetition_penalty,
             chunk_size=chunk_size,
             eos_logit_bias=eos_logit_bias,
+            cancel_event=cancel_event,
         )
         if not parity_mode:
             stream_kwargs["predictor_graph"] = self.predictor_graph
