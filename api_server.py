@@ -74,7 +74,7 @@ class SpeechRequest(BaseModel):
     repetition_penalty: float = Field(1.05, ge=1.0)
     eos_logit_bias: float = Field(0.0, description="Additive bias on the EOS logit (positive = shorter, negative = longer)")
     instruct: Optional[str] = Field(None, description="Style/dialect instruction")
-    chunk_size: int = Field(12, ge=1, description="Codec frames per streaming chunk")
+    chunk_size: int = Field(4, ge=1, description="Codec frames per streaming chunk")
 
 
 class VoiceInfo(BaseModel):

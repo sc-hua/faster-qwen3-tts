@@ -134,7 +134,7 @@ curl http://127.0.0.1:8000/v1/audio/speech \
     "ref_audio": "file:///absolute/path/ref.wav",
     "stream": true,
     "response_format": "wav",
-    "chunk_size": 12
+    "chunk_size": 4
   }' \
   --output out.wav
 ```
