@@ -770,6 +770,7 @@ def main():
         level=getattr(logging, args.log_level.upper()),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    logging.getLogger("numba").setLevel(logging.WARNING)
 
     from faster_qwen3_tts import FasterQwen3TTS
     from faster_qwen3_tts.voice_manager import VoiceManager
