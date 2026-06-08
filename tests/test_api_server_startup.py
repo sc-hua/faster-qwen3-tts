@@ -115,16 +115,16 @@ def _install_api_server_stubs():
     uvicorn.run = lambda *args, **kwargs: None
     sys.modules["uvicorn"] = uvicorn
 
-    audio_utils = types.ModuleType("faster_qwen3_tts.audio_utils")
-    audio_utils.audio_to_pcm16_bytes = lambda audio: b""
-    audio_utils.create_wav_header = lambda sr: b""
-    audio_utils.encode_audio = lambda audio, sr, fmt: b""
-    audio_utils.media_type = lambda fmt: "audio/wav"
+    utils = types.ModuleType("faster_qwen3_tts.utils")
+    utils.audio_to_pcm16_bytes = lambda audio: b""
+    utils.create_wav_header = lambda sr: b""
+    utils.encode_audio = lambda audio, sr, fmt: b""
+    utils.media_type = lambda fmt: "audio/wav"
 
     package = types.ModuleType("faster_qwen3_tts")
-    package.audio_utils = audio_utils
+    package.utils = utils
     sys.modules["faster_qwen3_tts"] = package
-    sys.modules["faster_qwen3_tts.audio_utils"] = audio_utils
+    sys.modules["faster_qwen3_tts.utils"] = utils
 
 
 def _load_api_server_module():

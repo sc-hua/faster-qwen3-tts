@@ -29,7 +29,7 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field, model_validator
 
-from faster_qwen3_tts.audio_utils import (
+from faster_qwen3_tts.utils import (
     audio_to_pcm16_bytes,
     create_wav_header,
     encode_audio,
