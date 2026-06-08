@@ -1,5 +1,6 @@
 import inspect
 import types
+from pathlib import Path
 
 import pytest
 import torch
@@ -205,3 +206,45 @@ def test_prepare_generation_requires_ref_audio_without_precomputed_prompt():
             language="English",
             voice_clone_prompt=None,
         )
+
+
+def test_recreated_prompt_file_does_not_reuse_cached_voice(tmp_path):
+    model = _build_dummy_model()
+    prompt_path = tmp_path / "speaker.pt"
+    prompt_path.write_bytes(b"old")
+    loads = []
+
+    def _load_prompt(pt_path, input_ids, ref_text):
+        marker = Path(pt_path).read_bytes()
+        loads.append(marker)
+        vcp = {
+            "ref_code": [None],
+            "ref_spk_embedding": [torch.tensor([len(marker)])],
+            "x_vector_only_mode": [True],
+            "icl_mode": [False],
+        }
+        return vcp, [None], False
+
+    model._load_voice_prompt_pt = _load_prompt
+    input_ids = [torch.tensor([[1]])]
+
+    first, _, _ = model._resolve_voice_clone_prompt_from_reference(
+        input_ids=input_ids,
+        ref_audio=prompt_path,
+        ref_text="",
+        xvec_only=True,
+        append_silence=True,
+    )
+    prompt_path.unlink()
+    prompt_path.write_bytes(b"new prompt")
+    second, _, _ = model._resolve_voice_clone_prompt_from_reference(
+        input_ids=input_ids,
+        ref_audio=prompt_path,
+        ref_text="",
+        xvec_only=True,
+        append_silence=True,
+    )
+
+    assert loads == [b"old", b"new prompt"]
+    assert first["ref_spk_embedding"][0].item() == 3
+    assert second["ref_spk_embedding"][0].item() == 10

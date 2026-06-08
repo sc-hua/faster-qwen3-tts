@@ -77,6 +77,27 @@ class FasterQwen3TTS:
         while len(self._voice_prompt_cache) > self._voice_prompt_cache_max:
             self._voice_prompt_cache.popitem(last=False)
 
+    @staticmethod
+    def _voice_prompt_cache_key(
+        ref_audio: Union[str, Path],
+        ref_text: str,
+        xvec_only: bool,
+        append_silence: bool,
+    ):
+        path = Path(ref_audio)
+        if path.suffix == ".pt":
+            stat = path.stat()
+            return (
+                str(path.resolve()),
+                stat.st_dev,
+                stat.st_ino,
+                stat.st_size,
+                stat.st_mtime_ns,
+                stat.st_ctime_ns,
+                ref_text,
+            )
+        return (str(ref_audio), ref_text, xvec_only, append_silence)
+
     def _prompt_dict_to_vcp(
         self,
         prompt_dict: dict,
@@ -663,7 +684,12 @@ class FasterQwen3TTS:
         xvec_only: bool,
         append_silence: bool,
     ) -> Tuple[Dict[str, Any], list, bool]:
-        cache_key = (str(ref_audio), ref_text, xvec_only, append_silence)
+        cache_key = self._voice_prompt_cache_key(
+            ref_audio,
+            ref_text,
+            xvec_only,
+            append_silence,
+        )
         if cache_key in self._voice_prompt_cache:
             self._voice_prompt_cache.move_to_end(cache_key)
             vcp, ref_ids = self._voice_prompt_cache[cache_key]
