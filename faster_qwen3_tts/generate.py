@@ -8,7 +8,12 @@ from typing import Optional, Tuple
 import torch
 
 from .predictor_graph import PredictorGraph
-from .sampling import apply_repetition_penalty, build_codec_suppress_mask, sample_logits
+from .sampling import (
+    apply_repetition_penalty,
+    build_codec_suppress_mask,
+    sample_logits,
+    validate_sampling_config,
+)
 from .talker_graph import TalkerGraph
 
 
@@ -93,6 +98,14 @@ def fast_generate(
             'steps_per_s': (steps / total_time) if total_time > 0 else 0.0,
         }
         return talker_codes_list[0] if talker_codes_list else None, timing
+
+    validate_sampling_config(
+        predictor_graph,
+        temperature=temperature,
+        top_k=top_k,
+        top_p=top_p,
+        do_sample=do_sample,
+    )
     
     predictor = talker.code_predictor
     talker_codec_embed = talker.get_input_embeddings()

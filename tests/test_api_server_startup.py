@@ -21,8 +21,12 @@ def _install_api_server_stubs():
     def Field(default=None, **kwargs):
         return default
 
+    def model_validator(*args, **kwargs):
+        return lambda fn: fn
+
     pydantic.BaseModel = BaseModel
     pydantic.Field = Field
+    pydantic.model_validator = model_validator
     sys.modules["pydantic"] = pydantic
 
     fastapi = types.ModuleType("fastapi")

@@ -76,7 +76,6 @@ python api_server.py \
   - `false`：ICL 模式，质量更高，但必须提供 `ref_text`
 - `stream`：是否流式返回，默认 `false`
 - `response_format`：`wav`、`pcm`、`flac`、`mp3`
-- `temperature`、`top_k`、`top_p`
 - `max_new_tokens`
 - `repetition_penalty`
 - `instruct`：风格或口音提示
@@ -144,6 +143,8 @@ curl http://127.0.0.1:8000/v1/audio/speech \
 - 流式返回实际只支持 `wav` 和 `pcm`，传其他格式时会退回 `pcm`
 - 返回头里会包含 `X-Sample-Rate` 和 `X-Request-Id`
 - 服务端会串行化 GPU 推理请求，不会并发跑多个生成任务
+- CUDA Graph 加速路径固定使用 `temperature=0.9`、`top_k=50`、
+  `top_p=1.0` 和采样模式，HTTP API 不提供运行时采样参数
 
 ### 2. 音色管理
 

@@ -12,7 +12,12 @@ from typing import Generator, Optional, Tuple
 import torch
 
 from .predictor_graph import PredictorGraph
-from .sampling import apply_repetition_penalty, build_codec_suppress_mask, sample_logits
+from .sampling import (
+    apply_repetition_penalty,
+    build_codec_suppress_mask,
+    sample_logits,
+    validate_sampling_config,
+)
 from .talker_graph import TalkerGraph
 
 
@@ -51,6 +56,13 @@ def fast_generate_streaming(
     device = talker_input_embeds.device
 
     suppress_mask = build_codec_suppress_mask(vocab_size, codebook_vocab_size, eos_id, device)
+    validate_sampling_config(
+        predictor_graph,
+        temperature=temperature,
+        top_k=top_k,
+        top_p=top_p,
+        do_sample=do_sample,
+    )
 
     predictor = talker.code_predictor
     talker_codec_embed = talker.get_input_embeddings()

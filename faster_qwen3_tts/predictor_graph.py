@@ -48,6 +48,7 @@ class PredictorGraph:
         self.top_k = top_k
         self.top_p = top_p
         self.temperature = temperature
+        self._captured_sampling_config = None
 
         # Extract model components (references, not copies)
         cp = code_predictor
@@ -74,6 +75,17 @@ class PredictorGraph:
         self.captured = False
         self.prefill_attn = None
         self.decode_attn = None
+
+    @property
+    def sampling_config(self):
+        if self._captured_sampling_config is not None:
+            return self._captured_sampling_config
+        return {
+            "temperature": self.temperature,
+            "top_k": self.top_k,
+            "top_p": self.top_p,
+            "do_sample": self.do_sample,
+        }
 
     def _init_cache_layers(self):
         """Force lazy initialization of StaticCache layers before graph capture."""
@@ -169,6 +181,14 @@ class PredictorGraph:
     @torch.inference_mode()
     def capture(self, num_warmup=3):
         """Warmup and capture the CUDA graph."""
+        if self.do_sample and self.temperature <= 0:
+            raise ValueError("temperature must be greater than 0 when do_sample=True")
+        self._captured_sampling_config = {
+            "temperature": self.temperature,
+            "top_k": self.top_k,
+            "top_p": self.top_p,
+            "do_sample": self.do_sample,
+        }
         print(f"Warming up predictor ({num_warmup} runs)...")
 
         # Force cache initialization before graph capture

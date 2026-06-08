@@ -27,7 +27,7 @@ import soundfile as sf
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from faster_qwen3_tts.audio_utils import (
     audio_to_pcm16_bytes,
@@ -67,14 +67,23 @@ class SpeechRequest(BaseModel):
     response_format: str = Field(
         "wav", description="Output format: wav, pcm, flac, mp3"
     )
-    temperature: float = Field(0.9, ge=0.0, le=2.0)
-    top_k: int = Field(50, ge=1)
-    top_p: float = Field(1.0, ge=0.0, le=1.0)
     max_new_tokens: int = Field(2048, ge=1)
     repetition_penalty: float = Field(1.05, ge=1.0)
     eos_logit_bias: float = Field(0.0, description="Additive bias on the EOS logit (positive = shorter, negative = longer)")
     instruct: Optional[str] = Field(None, description="Style/dialect instruction")
     chunk_size: int = Field(4, ge=1, description="Codec frames per streaming chunk")
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_runtime_sampling_parameters(cls, data):
+        if isinstance(data, dict):
+            unsupported = sorted({"temperature", "top_k", "top_p"} & data.keys())
+            if unsupported:
+                raise ValueError(
+                    "Runtime sampling parameters are not supported by the CUDA Graph "
+                    f"backend: {', '.join(unsupported)}"
+                )
+        return data
 
 
 class VoiceInfo(BaseModel):
@@ -308,9 +317,6 @@ async def _stream_tts(
             ref_audio=ref_audio_path,
             ref_text=request.ref_text or "",
             xvec_only=request.xvec_only,
-            temperature=request.temperature,
-            top_k=request.top_k,
-            top_p=request.top_p,
             max_new_tokens=request.max_new_tokens,
             repetition_penalty=request.repetition_penalty,
             chunk_size=request.chunk_size,
@@ -561,9 +567,6 @@ async def create_speech(request: SpeechRequest, raw_request: Request):
                 ref_audio=ref_audio_path,
                 ref_text=request.ref_text or "",
                 xvec_only=request.xvec_only,
-                temperature=request.temperature,
-                top_k=request.top_k,
-                top_p=request.top_p,
                 max_new_tokens=request.max_new_tokens,
                 repetition_penalty=request.repetition_penalty,
                 chunk_size=request.chunk_size,

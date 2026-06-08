@@ -7,6 +7,29 @@ import torch
 import torch.nn.functional as F
 
 
+def validate_sampling_config(
+    predictor_graph,
+    *,
+    temperature: float,
+    top_k: int,
+    top_p: float,
+    do_sample: bool,
+) -> None:
+    """Reject sampling settings that differ from the captured predictor graph."""
+    expected = predictor_graph.sampling_config
+    actual = {
+        "temperature": temperature,
+        "top_k": top_k,
+        "top_p": top_p,
+        "do_sample": do_sample,
+    }
+    if actual != expected:
+        raise ValueError(
+            "Sampling parameters are fixed when the predictor CUDA graph is captured; "
+            f"requested {actual}, captured {expected}."
+        )
+
+
 def build_codec_suppress_mask(
     vocab_size: int,
     codebook_vocab_size: int,
@@ -70,6 +93,8 @@ def sample_logits(
         logits[..., eos_id] = logits[..., eos_id] + eos_logit_bias
     if not do_sample:
         return torch.argmax(logits, dim=-1)
+    if temperature <= 0:
+        raise ValueError("temperature must be greater than 0 when do_sample=True")
     logits = logits / temperature
     if top_k > 0:
         topk_vals, _ = torch.topk(logits, min(top_k, logits.size(-1)))

@@ -4,7 +4,11 @@ import pytest
 import torch
 
 from faster_qwen3_tts.generate import fast_generate
-from faster_qwen3_tts.sampling import apply_repetition_penalty
+from faster_qwen3_tts.sampling import (
+    apply_repetition_penalty,
+    sample_logits,
+    validate_sampling_config,
+)
 
 
 def test_repetition_penalty_uses_all_history():
@@ -21,12 +25,51 @@ def test_repetition_penalty_uses_all_history():
     assert pytest.approx(out[0, 0, 8].item(), rel=1e-6) == -1.0 * 1.1
 
 
+def test_sampling_rejects_non_positive_temperature():
+    with pytest.raises(ValueError, match="temperature must be greater than 0"):
+        sample_logits(
+            torch.zeros(1, 4),
+            temperature=0,
+            top_k=4,
+            top_p=1.0,
+            do_sample=True,
+        )
+
+
+def test_sampling_config_must_match_predictor_graph():
+    graph = types.SimpleNamespace(
+        sampling_config={
+            "temperature": 0.9,
+            "top_k": 50,
+            "top_p": 1.0,
+            "do_sample": True,
+        }
+    )
+
+    validate_sampling_config(
+        graph,
+        temperature=0.9,
+        top_k=50,
+        top_p=1.0,
+        do_sample=True,
+    )
+    with pytest.raises(ValueError, match="fixed when the predictor CUDA graph is captured"):
+        validate_sampling_config(
+            graph,
+            temperature=0.5,
+            top_k=50,
+            top_p=1.0,
+            do_sample=True,
+        )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for fast_generate syncs.")
 def test_min_new_tokens_suppresses_early_eos():
     class DummyConfig:
         codec_eos_token_id = 1
         num_code_groups = 16
         vocab_size = 5
+        code_predictor_config = types.SimpleNamespace(vocab_size=5)
 
     class DummyCodePredictor:
         def __init__(self, vocab, hidden, num_codebooks, device):
@@ -77,6 +120,13 @@ def test_min_new_tokens_suppresses_early_eos():
             )
 
     class DummyPredictorGraph:
+        sampling_config = {
+            "temperature": 0.9,
+            "top_k": 50,
+            "top_p": 1.0,
+            "do_sample": False,
+        }
+
         def run(self, pred_input):
             return torch.zeros(15, dtype=torch.long, device=pred_input.device)
 
