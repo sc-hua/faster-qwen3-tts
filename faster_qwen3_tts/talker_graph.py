@@ -170,7 +170,7 @@ class TalkerGraph:
         return seq_len
 
     def set_generation_state(self, attention_mask: torch.Tensor, rope_deltas: torch.Tensor | None):
-        """Set padding-aware attention mask and rope deltas for decode parity."""
+        """Set the padding-aware attention mask and rope deltas for decode."""
         mask_key = None
         full_attention_mask = None
         if attention_mask is not None:

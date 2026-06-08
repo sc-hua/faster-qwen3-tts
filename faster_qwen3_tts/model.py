@@ -1115,7 +1115,7 @@ class FasterQwen3TTS:
         Returns:
             Tuple of ([audio_waveform], sample_rate)
         """
-        from .generate import fast_generate
+        from .generation_loop import fast_generate
 
         m, talker, config, tie, tam, tth, tpe, ref_codes = self._prepare_generation(
             text=text,
@@ -1170,7 +1170,6 @@ class FasterQwen3TTS:
         xvec_only: bool = False,
         non_streaming_mode: bool = False,
         append_silence: bool = True,
-        parity_mode: bool = False,
         instruct: Optional[str] = None,
         voice_clone_prompt: Optional[Union[Dict[str, Any], List[Any]]] = None,
         eos_logit_bias: float = 0.0,
@@ -1201,7 +1200,6 @@ class FasterQwen3TTS:
                 (reference audio in context).
             non_streaming_mode: Default False to match upstream text feeding during decode.
                 Set to True to prefill the full target text before streaming decode.
-            parity_mode: When True, disables CUDA graphs and uses dynamic cache streaming.
             voice_clone_prompt: Optional precomputed voice clone prompt dict. When provided,
                 `xvec_only` is ignored and prompt extraction from `ref_audio` is skipped.
                 This path supports x-vector-only prompts (`ref_spk_embedding` only)
@@ -1214,7 +1212,7 @@ class FasterQwen3TTS:
         Yields:
             Tuple of (audio_chunk_numpy, sample_rate, timing_dict)
         """
-        from .streaming import fast_generate_streaming, parity_generate_streaming
+        from .generation_loop import fast_generate_streaming
 
         import time as _time
         _t_prep_start = _time.monotonic()
@@ -1238,32 +1236,28 @@ class FasterQwen3TTS:
         if cancel_event is not None and cancel_event.is_set():
             return
 
-        stream_fn = parity_generate_streaming if parity_mode else fast_generate_streaming
-        stream_kwargs = dict(
-            talker=talker,
-            talker_input_embeds=tie,
-            attention_mask=tam,
-            trailing_text_hiddens=tth,
-            tts_pad_embed=tpe,
-            config=config,
-            max_new_tokens=max_new_tokens,
-            min_new_tokens=min_new_tokens,
-            temperature=temperature,
-            top_k=top_k,
-            top_p=top_p,
-            do_sample=do_sample,
-            repetition_penalty=repetition_penalty,
-            chunk_size=chunk_size,
-            eos_logit_bias=eos_logit_bias,
-            cancel_event=cancel_event,
-        )
-        if not parity_mode:
-            stream_kwargs["predictor_graph"] = self.predictor_graph
-            stream_kwargs["talker_graph"] = self.talker_graph
-
         yield from self._streaming_decode_chunks(
             speech_tokenizer,
-            stream_fn(**stream_kwargs),
+            fast_generate_streaming(
+                talker=talker,
+                talker_input_embeds=tie,
+                attention_mask=tam,
+                trailing_text_hiddens=tth,
+                tts_pad_embed=tpe,
+                config=config,
+                predictor_graph=self.predictor_graph,
+                talker_graph=self.talker_graph,
+                max_new_tokens=max_new_tokens,
+                min_new_tokens=min_new_tokens,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                do_sample=do_sample,
+                repetition_penalty=repetition_penalty,
+                chunk_size=chunk_size,
+                eos_logit_bias=eos_logit_bias,
+                cancel_event=cancel_event,
+            ),
             chunk_size,
             ref_codes=ref_codes,
         )
@@ -1294,7 +1288,7 @@ class FasterQwen3TTS:
         if self.model.model.tts_model_size in "0b6":
             instruct = None
 
-        from .generate import fast_generate
+        from .generation_loop import fast_generate
 
         m, talker, config, tie, tam, tth, tpe = self._prepare_generation_custom(
             text=text,
@@ -1351,7 +1345,7 @@ class FasterQwen3TTS:
         if self.model.model.tts_model_size in "0b6":
             instruct = None
 
-        from .streaming import fast_generate_streaming
+        from .generation_loop import fast_generate_streaming
 
         m, talker, config, tie, tam, tth, tpe = self._prepare_generation_custom(
             text=text,
@@ -1407,7 +1401,7 @@ class FasterQwen3TTS:
 
         self.model._validate_languages([language])
 
-        from .generate import fast_generate
+        from .generation_loop import fast_generate
 
         m, talker, config, tie, tam, tth, tpe = self._prepare_generation_custom(
             text=text,
@@ -1459,7 +1453,7 @@ class FasterQwen3TTS:
 
         self.model._validate_languages([language])
 
-        from .streaming import fast_generate_streaming
+        from .generation_loop import fast_generate_streaming
 
         m, talker, config, tie, tam, tth, tpe = self._prepare_generation_custom(
             text=text,
