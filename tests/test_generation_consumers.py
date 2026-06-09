@@ -4,7 +4,7 @@ import types
 
 import torch
 
-from faster_qwen3_tts import generation_loop
+from faster_qwen3_tts import generation
 
 
 def _state():
@@ -19,28 +19,28 @@ def _frames(count):
 def test_production_generation_api_has_no_parity_mode():
     assert (
         "parity_mode"
-        not in inspect.signature(generation_loop.fast_generate).parameters
+        not in inspect.signature(generation.fast_generate).parameters
     )
     assert (
         "parity_mode"
-        not in inspect.signature(generation_loop.fast_generate_streaming).parameters
+        not in inspect.signature(generation.fast_generate_streaming).parameters
     )
 
 
 def test_non_streaming_collects_shared_codec_frames(monkeypatch):
     monkeypatch.setattr(
-        generation_loop,
+        generation,
         "prepare_fast_generation",
         lambda **kwargs: _state(),
     )
     monkeypatch.setattr(
-        generation_loop,
+        generation,
         "iter_fast_codec_frames",
         lambda state, **kwargs: _frames(3),
     )
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
 
-    codec_ids, timing = generation_loop.fast_generate(
+    codec_ids, timing = generation.fast_generate(
         talker=None,
         talker_input_embeds=torch.zeros(1),
         attention_mask=torch.zeros(1),
@@ -58,19 +58,19 @@ def test_non_streaming_collects_shared_codec_frames(monkeypatch):
 
 def test_streaming_chunks_shared_codec_frames(monkeypatch):
     monkeypatch.setattr(
-        generation_loop,
+        generation,
         "prepare_fast_generation",
         lambda **kwargs: _state(),
     )
     monkeypatch.setattr(
-        generation_loop,
+        generation,
         "iter_fast_codec_frames",
         lambda state, **kwargs: _frames(5),
     )
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
 
     chunks = list(
-        generation_loop.fast_generate_streaming(
+        generation.fast_generate_streaming(
             talker=None,
             talker_input_embeds=torch.zeros(1),
             attention_mask=torch.zeros(1),
@@ -101,12 +101,12 @@ def test_streaming_skips_prefill_when_already_cancelled(monkeypatch):
         called = True
         return _state()
 
-    monkeypatch.setattr(generation_loop, "prepare_fast_generation", _prepare)
+    monkeypatch.setattr(generation, "prepare_fast_generation", _prepare)
     cancel_event = threading.Event()
     cancel_event.set()
 
     chunks = list(
-        generation_loop.fast_generate_streaming(
+        generation.fast_generate_streaming(
             talker=None,
             talker_input_embeds=torch.zeros(1),
             attention_mask=torch.zeros(1),

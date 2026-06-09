@@ -1115,7 +1115,7 @@ class FasterQwen3TTS:
         Returns:
             Tuple of ([audio_waveform], sample_rate)
         """
-        from .generation_loop import fast_generate
+        from .generation import fast_generate
 
         m, talker, config, tie, tam, tth, tpe, ref_codes = self._prepare_generation(
             text=text,
@@ -1212,7 +1212,7 @@ class FasterQwen3TTS:
         Yields:
             Tuple of (audio_chunk_numpy, sample_rate, timing_dict)
         """
-        from .generation_loop import fast_generate_streaming
+        from .generation import fast_generate_streaming
 
         import time as _time
         _t_prep_start = _time.monotonic()
@@ -1288,7 +1288,7 @@ class FasterQwen3TTS:
         if self.model.model.tts_model_size in "0b6":
             instruct = None
 
-        from .generation_loop import fast_generate
+        from .generation import fast_generate
 
         m, talker, config, tie, tam, tth, tpe = self._prepare_generation_custom(
             text=text,
@@ -1345,7 +1345,7 @@ class FasterQwen3TTS:
         if self.model.model.tts_model_size in "0b6":
             instruct = None
 
-        from .generation_loop import fast_generate_streaming
+        from .generation import fast_generate_streaming
 
         m, talker, config, tie, tam, tth, tpe = self._prepare_generation_custom(
             text=text,
@@ -1401,7 +1401,7 @@ class FasterQwen3TTS:
 
         self.model._validate_languages([language])
 
-        from .generation_loop import fast_generate
+        from .generation import fast_generate
 
         m, talker, config, tie, tam, tth, tpe = self._prepare_generation_custom(
             text=text,
@@ -1453,7 +1453,7 @@ class FasterQwen3TTS:
 
         self.model._validate_languages([language])
 
-        from .generation_loop import fast_generate_streaming
+        from .generation import fast_generate_streaming
 
         m, talker, config, tie, tam, tth, tpe = self._prepare_generation_custom(
             text=text,

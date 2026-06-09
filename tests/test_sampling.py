@@ -3,7 +3,7 @@ import types
 import pytest
 import torch
 
-from faster_qwen3_tts.generation_loop import fast_generate
+from faster_qwen3_tts.generation import fast_generate
 from faster_qwen3_tts.sampling import (
     apply_repetition_penalty,
     sample_logits,
