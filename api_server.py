@@ -44,7 +44,6 @@ logger = logging.getLogger(__name__)
 _model = None  # FasterQwen3TTS
 _voice_manager = None  # VoiceManager
 _gpu_lock = asyncio.Lock()  # Serialize GPU inference
-_active_cancel_flag: threading.Event | None = None  # Cancel flag of in-flight request
 
 
 # ── Pydantic schemas ────────────────────────────────────────────
@@ -391,10 +390,7 @@ async def _stream_tts(
         # generator crashes Starlette's internal TaskGroup.  Just let
         # the generator end; the finally block handles cleanup.
     finally:
-        global _active_cancel_flag
         cancel_flag.set()
-        if _active_cancel_flag is cancel_flag:
-            _active_cancel_flag = None
 
         def _do_cleanup():
             """Close generator + release GPU lock (must run on event-loop thread)."""
@@ -485,17 +481,10 @@ async def create_speech(request: SpeechRequest, raw_request: Request):
 
     Provide either `voice` (registered name) or `ref_audio` (inline audio).
     """
-    global _active_cancel_flag
     ref_audio_path = None
     cleanup_path = None
     cancel_flag, watcher = _start_disconnect_watcher(raw_request)
     watcher_owned_by_stream = False
-
-    # Auto-cancel any in-flight inference so the new request doesn't queue.
-    prev = _active_cancel_flag
-    if prev is not None:
-        prev.set()
-    _active_cancel_flag = cancel_flag
 
     try:
         # Validate ICL mode requires ref_text
@@ -621,8 +610,6 @@ async def create_speech(request: SpeechRequest, raw_request: Request):
     finally:
         if not watcher_owned_by_stream:
             cancel_flag.set()
-            if _active_cancel_flag is cancel_flag:
-                _active_cancel_flag = None
             await _stop_disconnect_watcher(watcher)
         if cleanup_path:
             Path(cleanup_path).unlink(missing_ok=True)
